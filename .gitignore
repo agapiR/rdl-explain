@@ -44,3 +44,7 @@ venv/
 # macOS / Linux / Windows
 .DS_Store
 Thumbs.db
+
+# Logs and data
+results/
+data/
