@@ -19,28 +19,31 @@ from torch_frame import stype
 from torch_frame.data import DataLoader as TensorFrameDataLoader
 
 # Explain module imports
-from src.explain.explain_utils import perturb_instance, node_type_to_col_names, node_type_to_col_names_by_stype
+from rdl_explain.explain.explain_utils import perturb_instance, node_type_to_col_names, node_type_to_col_names_by_stype
 
+# Relbench imports
+from relbench.base import EntityTask, TaskType
+from relbench.modeling.graph import NodeTrainTableInput, get_node_train_table_input
 
 class RDLExplainer(ABC):
 
     name = "node_rdl_explainer"
 
-    def __init__(self, config: ModelConfig, model: torch.nn.Module, data: HeteroData, task: NodeTask):
+    def __init__(self, config: Dict, model: torch.nn.Module, data: HeteroData, task: EntityTask):
         """Initialize the RDLExplainer."""
         self.config = config
         self.data = data
         self.explanation_task = task
         self.model_to_explain = model
-        self.device = config.training_parameters.device
+        self.device = self.config.inference.device
         self.model_to_explain.to(self.device) # Move the model to the device
         # Initialize task tables
         self.train_table, self.val_table, self.test_table = self._initialize_task_tables()
 
     def _initialize_task_tables(self):
-        train_table_input = get_node_train_table_input(table=self.explanation_task.train_table, task=self.explanation_task, split='train')
-        val_table_input = get_node_train_table_input(table=self.explanation_task.val_table, task=self.explanation_task, split='train') #'val')
-        test_table_input = get_node_train_table_input(table=self.explanation_task.test_table, task=self.explanation_task, split='train') # 'test')
+        train_table_input = get_node_train_table_input(table=self.explanation_task.train_table, task=self.explanation_task)
+        val_table_input = get_node_train_table_input(table=self.explanation_task.val_table, task=self.explanation_task)
+        test_table_input = get_node_train_table_input(table=self.explanation_task.test_table, task=self.explanation_task)
         return train_table_input, val_table_input, test_table_input
 
     def initialize_masks(self, explanation_type: str, mu: float = 10, std: float = 1, filter_predicate: Optional[Tuple[str, str, stype, str, List]] = None) -> Dict:
@@ -82,10 +85,10 @@ class RDLExplainer(ABC):
             mask = {edge_type: Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for edge_type in p2f_edges}
             mask.update({edge_type: mask[(edge_type[2], 'rev_' + edge_type[1], edge_type[0])] for edge_type in f2p_edges})
         elif explanation_type == 'fkpk-layer-wise':
-            masked_elements = [(edge_type, layer) for edge_type in self.data.edge_types for layer in range(self.config.gnn.parameters.num_layers+1)]
+            masked_elements = [(edge_type, layer) for edge_type in self.data.edge_types for layer in range(self.config.model.gnn_layers+1)]
             mask = {(edge_type, layer): Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for edge_type, layer in masked_elements}
         elif explanation_type == 'layer-wise':
-            masked_elements = [(node_type, layer) for node_type in self.data.node_types for layer in range(self.config.gnn.parameters.num_layers+1)]
+            masked_elements = [(node_type, layer) for node_type in self.data.node_types for layer in range(self.config.model.gnn_layers+1)]
             mask = {(node_type, layer): Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for node_type, layer in masked_elements}
         else:
             raise ValueError(f"Unknown explanation type: '{explanation_type}'")
@@ -95,16 +98,16 @@ class RDLExplainer(ABC):
         """Create a NeighborLoader for the given split."""
         return NeighborLoader(
             data,
-            num_neighbors=self.config.sampler.parameters.fanouts,
+            num_neighbors=self.config.sampler.num_neighbors,
             time_attr="time" if table_input.time is not None else None,
             input_nodes=table_input.nodes,
             input_time=table_input.time,
             transform=table_input.transform,
-            batch_size=self.config.inference_parameters.test_batch_size,
-            temporal_strategy=self.config.sampler.parameters.temporal_strategy,
+            batch_size=self.config.inference.batch_size,
+            temporal_strategy=self.config.sampler.temporal_strategy,
             shuffle=shuffle,
-            num_workers=self.config.sampler.parameters.num_workers,
-            persistent_workers=self.config.sampler.parameters.num_workers > 0,
+            num_workers=self.config.sampler.num_workers,
+            persistent_workers=self.config.sampler.num_workers > 0,
         )
 
     def create_loader(self, data: HeteroData, split: str, shuffle: bool = False) -> NeighborLoader:
@@ -126,7 +129,7 @@ class RDLExplainer(ABC):
         tf_for_node_type = self.data[node_type].tf
         return TensorFrameDataLoader(
             tf_for_node_type, 
-            batch_size=self.config.inference_parameters.test_batch_size,
+            batch_size=self.config.inference.batch_size,
             shuffle=shuffle,
         )
 

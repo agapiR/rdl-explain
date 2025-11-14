@@ -17,6 +17,9 @@ import networkx as nx
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# Relbench imports
+from relbench.base import Database
+
 def node_type_to_col_names_by_stype(graph):
     return {node_type: graph[node_type].tf.col_names_dict for node_type in graph.node_types}
 
@@ -513,113 +516,6 @@ def draw_schema_dag(
         plt.savefig(save_path, format='png', bbox_inches='tight')
     else:
         plt.show()
-
-# TODO: Rethink this function, how should we produce the explanation task?
-def prepare_node_explanation_task(
-    prediction_task: NodeTask,
-    predictions: Dict[str, pd.DataFrame],
-    explanation_target_type: str = 'soft',
-    n_training_samples: Optional[int] = None,
-    n_eval_samples: Optional[int] = None,
-    split: Optional[str] = None,
-) -> NodeTask:
-
-    target_col = prediction_task.target_col
-    task_type = prediction_task.task_type
-
-    def subsample_task_table(task_table: pd.DataFrame, n_samples: int = 100, stratified_sampling: bool = True) -> pd.DataFrame:
-        cols = list(task_table.columns)
-        if (task_type == TaskType.BINARY_CLASSIFICATION or task_type == TaskType.MULTICLASS_CLASSIFICATION) and stratified_sampling:
-            n_minority_class = task_table[target_col].value_counts().min()
-            k_classes = task_table[target_col].nunique()
-            n_samples = min(n_samples//k_classes, n_minority_class)
-            return task_table.groupby(target_col, group_keys=False)[cols].apply(lambda x: x.sample(n=n_samples)).reset_index(drop=True)
-        else:
-            return task_table.sample(n=min(n_samples, len(task_table)), replace=False).reset_index(drop=True)
-
-    def train_test_split_task_table(
-        task_table: pd.DataFrame, 
-        n_training_samples: int = 100,
-        n_eval_samples: int = 100, 
-        stratified_sampling: bool = True,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Split the task table into train and test sets. 
-        For classification tasks and stratified sampling:   min(n_training_samples // k_classes , f_training * n_minority_class) samples per class for training 
-                                                            min(n_eval_samples // k_classes, f_test * n_minority_class) samples per class for testing
-        For other tasks:
-            - Sample min(n_training_samples, f_training * len(task_table)) for training and min(n_eval_samples, f_test * len(task_table)) for testing.
-        With f_training = n_training_samples / (n_training_samples + n_eval_samples) and f_test = n_eval_samples / (n_training_samples + n_eval_samples).
-        """
-        cols = list(task_table.columns)
-        f_training = n_training_samples / (n_training_samples + n_eval_samples) if n_eval_samples is not None else 1.0
-        f_test = n_eval_samples / (n_training_samples + n_eval_samples) if n_eval_samples is not None else 0.0
-        if (task_type == TaskType.BINARY_CLASSIFICATION or task_type == TaskType.MULTICLASS_CLASSIFICATION) and stratified_sampling:
-            k_classes = task_table[target_col].nunique()
-            n_minority_class = task_table[target_col].value_counts().min()
-            n_training_samples_per_class = min(
-                n_training_samples // k_classes, 
-                math.floor(f_training * n_minority_class)
-            )
-            n_eval_samples_per_class = min(
-                n_eval_samples // k_classes, 
-                math.floor(f_test * n_minority_class)
-            )
-            train_table = task_table.groupby(target_col, group_keys=False)[cols].apply(lambda x: x.sample(n=n_training_samples_per_class))
-            test_table = task_table.drop(train_table.index).groupby(target_col, group_keys=False)[cols].apply(lambda x: x.sample(n=n_eval_samples_per_class))
-        else:
-            train_table = task_table.sample(n=min(n_training_samples, f_training * len(task_table)), replace=False)[cols]
-            test_table = task_table.drop(train_table.index).sample(n=min(n_eval_samples, f_test * len(task_table)), replace=False)[cols]
-        train_index = train_table.index
-        test_index = test_table.index
-        # Ensure that train and test indices are disjoint and unique
-        if not train_index.is_unique or not test_index.is_unique:
-            raise ValueError("Train and test indices must be unique and disjoint.")
-        else:
-            print(f"Validation: Train indices are unique: {train_index.is_unique}, Test indices are unique: {test_index.is_unique}.")
-        combined_table = pd.concat([train_table, test_table], ignore_index=True)
-        duplicates = combined_table.duplicated()
-        print(f"Validation: Found {duplicates.sum()} duplicate rows across train and test tables.")
-        if duplicates.any():
-            raise ValueError("Train and test indices must be disjoint.")
-        else:
-            print(f"Validation: Train and test indices are disjoint.")
-        return train_table.reset_index(drop=True), test_table.reset_index(drop=True)
-        
-    print("Preparing explanation task...")
-    explanation_task = copy.deepcopy(prediction_task)
-    explanation_task.explanation_target_type = explanation_target_type
-    # If split is not specified, use the splits as provided in the predictions
-    if split is None:
-        if n_training_samples is None:
-            explanation_task.train_table.df = predictions['train']
-        else:
-            explanation_task.train_table.df = subsample_task_table(predictions['train'], n_samples=n_training_samples)
-        if n_eval_samples is None:
-            explanation_task.val_table.df = predictions['val']
-            explanation_task.test_table.df = predictions['test']
-        else:
-            explanation_task.val_table.df = subsample_task_table(predictions['val'], n_samples=n_eval_samples)
-            explanation_task.test_table.df = subsample_task_table(predictions['test'], n_samples=n_eval_samples)
-    # If split is specified, use this predictions split to further split into train / test tables
-    else:
-        if split not in predictions:
-            raise ValueError(f"Split '{split}' not found in predictions. Available splits: {list(predictions.keys())}")
-        explanation_task.train_table.df, explanation_task.test_table.df = train_test_split_task_table(predictions[split], n_training_samples=n_training_samples, n_eval_samples=n_eval_samples)
-        explanation_task.val_table.df = copy.deepcopy(explanation_task.train_table.df) # copy the training table for validation
-
-    # For classification tasks, add a column 'targets' to the train, val, and test tables that is the same as the target column
-    if task_type == TaskType.BINARY_CLASSIFICATION: 
-        explanation_task.train_table.df['targets'] = explanation_task.train_table.df[target_col]
-        explanation_task.val_table.df['targets'] = explanation_task.val_table.df[target_col]
-        explanation_task.test_table.df['targets'] = explanation_task.test_table.df[target_col]
-    explanation_task.explanation_target_column = 'predictions'
-    explanation_task.explanation_soft_target_column = 'processed_output'
-    explanation_task.target_col = explanation_task.explanation_soft_target_column if explanation_task.explanation_target_type == 'soft' else explanation_task.explanation_target_column
-    print(f"Done preparing explanation task with {len(explanation_task.train_table.df)} training samples, "
-            f"{len(explanation_task.val_table.df)} validation samples, and {len(explanation_task.test_table.df)} test samples.")
-
-    return explanation_task
 
 def explanation_element_wording(k: Any) -> str:
     """
