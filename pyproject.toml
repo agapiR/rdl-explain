@@ -1,0 +1,14 @@
+[project]
+name = "rdl-explain"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Explanations for Relational Deep Learning"
+authors = [{name = "Agapi Rissaki", email = "rissaki.agapi@gmail.com"}]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["rdl_explain", "rdl_explain.model", "rdl_explain.explain"]

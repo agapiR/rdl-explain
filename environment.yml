@@ -1,0 +1,26 @@
+name: relbench_ar
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - jupyter
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pip:
+      - torch==2.4.0
+      - torch-geometric
+      - torch-sparse
+      - torch-scatter
+      - torch-cluster
+      - torch-spline-conv
+      - pyg-lib
+      - pytorch_frame
+      - relbench
+      - sentence-transformers
+      - --find-links https://data.pyg.org/whl/torch-2.4.0+cu124.html
+      - -e .

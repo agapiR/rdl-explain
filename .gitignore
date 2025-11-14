@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+*.eggs/
+pip-wheel-metadata/
+
+# Editable install artifacts
+*.egg-link
+
+# Virtual environments
+env/
+venv/
+*.env/
+.conda/
+.venv/
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+*.model
+*.tensorboard
+*.log
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# macOS / Linux / Windows
+.DS_Store
+Thumbs.db
