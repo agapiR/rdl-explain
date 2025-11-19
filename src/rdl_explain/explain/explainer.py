@@ -35,7 +35,7 @@ class RDLExplainer(ABC):
         self.data = data
         self.explanation_task = task
         self.model_to_explain = model
-        self.device = self.config.inference.device
+        self.device = self.config.device
         self.model_to_explain.to(self.device) # Move the model to the device
         # Initialize task tables
         self.train_table, self.val_table, self.test_table = self._initialize_task_tables()
@@ -85,10 +85,10 @@ class RDLExplainer(ABC):
             mask = {edge_type: Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for edge_type in p2f_edges}
             mask.update({edge_type: mask[(edge_type[2], 'rev_' + edge_type[1], edge_type[0])] for edge_type in f2p_edges})
         elif explanation_type == 'fkpk-layer-wise':
-            masked_elements = [(edge_type, layer) for edge_type in self.data.edge_types for layer in range(self.config.model.gnn_layers+1)]
+            masked_elements = [(edge_type, layer) for edge_type in self.data.edge_types for layer in range(self.config.gnn_layers+1)]
             mask = {(edge_type, layer): Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for edge_type, layer in masked_elements}
         elif explanation_type == 'layer-wise':
-            masked_elements = [(node_type, layer) for node_type in self.data.node_types for layer in range(self.config.model.gnn_layers+1)]
+            masked_elements = [(node_type, layer) for node_type in self.data.node_types for layer in range(self.config.gnn_layers+1)]
             mask = {(node_type, layer): Parameter(torch.randn(1, device=self.device) * std + mu).to(self.device) for node_type, layer in masked_elements}
         else:
             raise ValueError(f"Unknown explanation type: '{explanation_type}'")
@@ -98,16 +98,16 @@ class RDLExplainer(ABC):
         """Create a NeighborLoader for the given split."""
         return NeighborLoader(
             data,
-            num_neighbors=self.config.sampler.num_neighbors,
+            num_neighbors=self.config.num_neighbors,
             time_attr="time" if table_input.time is not None else None,
             input_nodes=table_input.nodes,
             input_time=table_input.time,
             transform=table_input.transform,
-            batch_size=self.config.inference.batch_size,
-            temporal_strategy=self.config.sampler.temporal_strategy,
+            batch_size=self.config.inference_batch_size,
+            temporal_strategy=self.config.temporal_strategy,
             shuffle=shuffle,
-            num_workers=self.config.sampler.num_workers,
-            persistent_workers=self.config.sampler.num_workers > 0,
+            num_workers=self.config.num_workers,
+            persistent_workers=self.config.num_workers > 0,
         )
 
     def create_loader(self, data: HeteroData, split: str, shuffle: bool = False) -> NeighborLoader:
@@ -129,7 +129,7 @@ class RDLExplainer(ABC):
         tf_for_node_type = self.data[node_type].tf
         return TensorFrameDataLoader(
             tf_for_node_type, 
-            batch_size=self.config.inference.batch_size,
+            batch_size=self.config.inference_batch_size,
             shuffle=shuffle,
         )
 
