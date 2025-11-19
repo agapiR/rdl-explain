@@ -47,4 +47,4 @@ Thumbs.db
 
 # Logs and data
 results/
-data/
+cache*/
