@@ -1,3 +1,27 @@
+"""
+Model definition for relational deep learning on heterogeneous temporal graphs.
+
+Adapted from:
+    RelBench
+    GitHub: https://github.com/snap-stanford/relbench
+    Commit: f4fdd49f8348e8e83fa9a498567611928ea36528
+    File: relbench/examples/model.py
+    Original authors: Stanford SNAP Lab
+    MIT License
+
+Modifications by:
+    Agapi Rissaki, 2025
+
+Description of changes:
+- Modified imports to use local neural network components.
+- Added method `forward_to_explain` for explanation via masking.
+- Added method `get_intermediate_encoding` to retrieve intermediate encodings.
+
+Notes:
+- Code is based on the above commit to ensure reproducibility.
+- All original functionality retained unless explicitly modified.
+"""
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -37,6 +61,7 @@ class Model(torch.nn.Module):
                 for node_type in data.node_types
             },
             node_to_col_stats=col_stats_dict,
+            torch_frame_model_kwargs={"channels": channels, "num_layers": 2}
         )
         self.temporal_encoder = HeteroTemporalEncoder(
             node_types=[
