@@ -1,4 +1,4 @@
-name: relbench_ar
+name: relbench_v1
 channels:
   - defaults
   - conda-forge
@@ -8,7 +8,7 @@ dependencies:
   - jupyter
   - numpy
   - scipy
-  - pandas
+  - pandas=2.3.3
   - scikit-learn
   - matplotlib
   - pip:
@@ -20,7 +20,8 @@ dependencies:
       - torch-spline-conv
       - pyg-lib
       - pytorch_frame
-      - relbench
+      - pyarrow==22.0.0
+      - relbench==1.1.0
       - sentence-transformers
       - --find-links https://data.pyg.org/whl/torch-2.4.0+cu124.html
       - pydantic
