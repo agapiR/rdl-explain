@@ -1,2 +1,2 @@
-from .model import Model
-from .config import ModelConfig
+from .gnn import Model, ModelConfig
+from .relgt import RelGT, RelGTConfig, RelGTTokens
