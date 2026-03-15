@@ -25,4 +25,6 @@ dependencies:
       - sentence-transformers
       - --find-links https://data.pyg.org/whl/torch-2.4.0+cu124.html
       - pydantic
+      - einops
+      - h5py
       - -e .
