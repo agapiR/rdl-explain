@@ -14,6 +14,8 @@ Modifications by:
 
 Description of changes:
 - Changed imports to use relative package imports (.codebook, .local_module, .encoders).
+- Added method `forward_to_explain` for explanation via masking.
+- Added method `get_intermediate_encoding` to retrieve intermediate encodings.
 
 Notes:
 - Code is based on the above commit to ensure reproducibility.
@@ -34,7 +36,7 @@ from einops import rearrange
 from .local_module import LocalModule
 
 from torch_frame.data.stats import StatType
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 from .encoders import NeighborNodeTypeEncoder, NeighborHopEncoder, NeighborTimeEncoder, NeighborTfsEncoder, GNNPEEncoder
 
@@ -332,6 +334,99 @@ class RelGT(torch.nn.Module):
         x_set = self.head(x_set)
 
         return x_set
+
+    def forward_to_explain(
+        self,
+        explanation_type: str,
+        mask_dict: Dict,
+        neighbor_types,
+        node_indices,
+        neighbor_hops,
+        neighbor_times,
+        grouped_tf_dict,
+        edge_index=None,
+        batch=None,
+        elimination_strategy: str = 'zero',
+        uninformative_feat_vector: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        """
+        Forward method used for explanations via masking.
+
+        Args:
+            explanation_type (str): Type of explanation ('table', 'column').
+            mask_dict (Dict): Dictionary containing masks.
+            neighbor_types: [B, K] tensor of neighbor node type indices.
+            node_indices: Global node indices for seed nodes.
+            neighbor_hops: [B, K] tensor of hop distances.
+            neighbor_times: [B, K] tensor of relative times.
+            grouped_tf_dict: Dictionary with grouped TorchFrame data.
+            edge_index: Edge index for subgraph adjacency.
+            batch: Batch assignment vector for subgraph nodes.
+            elimination_strategy (str): Strategy for feature elimination via masking.
+            uninformative_feat_vector: Optional dict of replacement feature vectors per node type.
+
+        Returns:
+            Tensor: Model output after applying explanation masks.
+        """
+
+        if explanation_type not in ['table', 'column']:
+            raise NotImplementedError(
+                f"Explanation type '{explanation_type}' not implemented."
+            )
+
+        # Apply activation to mask
+        mask = {key: value.sigmoid() for key, value in mask_dict.items()}
+
+        # Encode neighbor features with masking applied
+        neighbor_tfs = self.layer_norm_tfs(
+            self.tfs_encoder.forward_to_explain(
+                grouped_tf_dict, neighbor_types, mask,
+                mask_type=explanation_type,
+                elimination_strategy=elimination_strategy,
+                uninformative_feat_vector=uninformative_feat_vector,
+            )
+        )
+
+        # Remaining encoders proceed as normal (unmasked)
+        neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+        neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
+
+        cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
+        if self.ablate_idx is not None:
+            cat_list.pop(self.ablate_idx)
+        x_set = torch.cat(cat_list, dim=-1)
+        x_set = self.in_mixture(x_set)
+
+        x = x_set[:, 0, :]  # select seed token representation
+        for i, conv in enumerate(self.convs):
+            x_set = conv(x_set, x, node_indices)
+            x_set = self.ffs[i](x_set)
+        x_set = self.head(x_set)
+
+        return x_set
+
+    def get_intermediate_encoding(
+        self,
+        batch,
+        entity_table: str,
+    ) -> Tuple[Tuple[torch.Tensor, List[str]], torch.Tensor]:
+        """
+        Get intermediate column-wise and fused encoding from the TorchFrame
+        encoder for a given node type.
+
+        Args:
+            batch: Object with a tf_dict attribute mapping node types to TensorFrames
+                   (same interface as HeteroData).
+            entity_table: The node type string to get encoding for.
+
+        Returns:
+            A tuple containing:
+                - (intermediate_enc, col_names): column-wise encoding and column names
+                - fused_enc: fused encoding after backbone
+        """
+        return self.tfs_encoder.get_intermediate_encoding(batch.tf_dict[entity_table], entity_table)
 
     def global_forward(self, x, pos_enc, node_indices):
         raise NotImplementedError

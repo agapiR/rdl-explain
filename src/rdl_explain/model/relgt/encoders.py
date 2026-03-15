@@ -13,7 +13,8 @@ Modifications by:
     Agapi Rissaki, 2026
 
 Description of changes:
-- No changes. Local torch_frame encoder swap is planned but not yet applied.
+- Replaced torch_frame ResNet import with local ResNet that supports explanation via masking.
+- Added forward_to_explain() and get_intermediate_encoding() methods to NeighborTfsEncoder.
 
 Notes:
 - Code is based on the above commit to ensure reproducibility.
@@ -140,8 +141,10 @@ class NeighborTimeEncoder(nn.Module):
         return out
     
     
-from torch_frame.nn.models import ResNet  # Ensure torch_frame is installed and imported correctly
-from typing import Dict, Any
+# Replace with local imports
+# from torch_frame.nn.models import ResNet
+from rdl_explain.model.local_torch_frame.torch_frame_resnet_encoder import ResNet
+from typing import Dict, Any, List, Optional, Tuple, Union
 
     
 class NeighborTfsEncoder(nn.Module):
@@ -271,14 +274,119 @@ class NeighborTfsEncoder(nn.Module):
 
         # 2) Scatter [N, channels] -> [B, K, channels]
         output = torch.zeros((B, K, self.channels), device=device)
-        
+
         indices_i = torch.tensor(flat_batch_idx, dtype=torch.long, device=device)
         indices_j = torch.tensor(flat_nbr_idx,   dtype=torch.long, device=device)
         output[indices_i, indices_j] = encoded_flat_tensor
 
         return output
-    
-    
+
+    def forward_to_explain(
+        self,
+        batch_dict,
+        neighbor_types,
+        mask_dict: Union[Dict[Tuple[str, str], torch.Tensor], Dict[str, torch.Tensor]],
+        mask_type: str = 'column',
+        elimination_strategy: str = 'zero',
+        uninformative_feat_vector: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        """
+        Explanation-aware forward pass for neighbor TorchFrame encoding.
+
+        Mirrors forward(), but delegates to each per-node-type ResNet's
+        forward_to_explain() so that column (or table) masks are applied
+        before the backbone.
+
+        Args:
+            batch_dict: Same structure as in forward().
+            neighbor_types: [B, K] tensor of node type indices.
+            mask_dict: For 'column' mask_type: Dict[(node_type, col_name), Tensor].
+                       For 'table' mask_type: Dict[node_type, Tensor].
+            mask_type: 'column' or 'table'.
+            elimination_strategy: Strategy for feature elimination via masking.
+            uninformative_feat_vector: Optional dict of replacement feature vectors per node type.
+
+        Returns:
+            Tensor: [B, K, channels] encoded neighbor features with masks applied.
+        """
+        grouped_tfs = batch_dict["grouped_tfs"]
+        grouped_indices = batch_dict["grouped_indices"]
+        flat_batch_idx = batch_dict["flat_batch_idx"]
+        flat_nbr_idx   = batch_dict["flat_nbr_idx"]
+
+        B, K = neighbor_types.shape
+        N = len(flat_batch_idx)
+        device = neighbor_types.device
+
+        encoded_flat_tensor = torch.zeros((N, self.channels), device=device)
+
+        for t_int, big_tf in grouped_tfs.items():
+            node_type_str = self.inv_node_type_map[t_int]
+            encoder = self.encoders[node_type_str]
+
+            big_tf = big_tf.to(device=device)
+
+            for stype, tensor in big_tf.feat_dict.items():
+                if isinstance(tensor, torch.Tensor):
+                    big_tf.feat_dict[stype] = torch.nan_to_num(
+                        tensor, nan=0.0, posinf=1e6, neginf=-1e6
+                    )
+
+            # Filter mask for this node type
+            if mask_type == 'column':
+                mask_for_node_type = {c: mask_dict[(n, c)] for n, c in mask_dict.keys() if n == node_type_str}
+            elif mask_type == 'table':
+                mask_for_node_type = mask_dict[node_type_str]
+            else:
+                raise ValueError(f"Invalid mask type: {mask_type}")
+
+            ufv = uninformative_feat_vector[node_type_str] if uninformative_feat_vector is not None else None
+
+            out_t = encoder.forward_to_explain(
+                big_tf,
+                mask_for_node_type,
+                mask_type=mask_type,
+                elimination_strategy=elimination_strategy,
+                uninformative_feat_vector=ufv,
+            )
+            if out_t.dim() == 3 and out_t.shape[1] == 1:
+                out_t = out_t.squeeze(1)
+
+            idx_list = grouped_indices[t_int]
+            idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+            encoded_flat_tensor[idx_tensor] = out_t
+
+        # Scatter [N, channels] -> [B, K, channels]
+        output = torch.zeros((B, K, self.channels), device=device)
+
+        indices_i = torch.tensor(flat_batch_idx, dtype=torch.long, device=device)
+        indices_j = torch.tensor(flat_nbr_idx,   dtype=torch.long, device=device)
+        output[indices_i, indices_j] = encoded_flat_tensor
+
+        return output
+
+    def get_intermediate_encoding(
+        self,
+        tf: torch_frame.TensorFrame,
+        node_type: str,
+    ) -> Tuple[Tuple[torch.Tensor, List[str]], torch.Tensor]:
+        """
+        Get intermediate column-wise and fused encoding from the ResNet encoder
+        for a given node type.
+
+        Args:
+            tf: TensorFrame for the node type.
+            node_type: The node type string.
+
+        Returns:
+            A tuple containing:
+                - (intermediate_enc, col_names): column-wise encoding and column names
+                - fused_enc: fused encoding after backbone
+        """
+        encoder = self.encoders[node_type]
+        return encoder.get_intermediate_encoding(tf)
+
+
 from torch_geometric.nn import GINConv
 
 class GNNPEEncoder(nn.Module):
