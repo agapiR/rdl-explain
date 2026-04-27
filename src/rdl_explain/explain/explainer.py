@@ -1,9 +1,10 @@
+import math
 import os
 import time
 import gc
 
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Union
 from tqdm import tqdm
 import numpy as np
 from collections import deque
@@ -206,6 +207,68 @@ class RDLExplainer(ABC):
             raise ValueError(f"Unsupported regularization type: {reg_type}")
         return reg_fn
 
+    @staticmethod
+    def _round_eps(eps: float) -> float:
+        """Round eps to the nearest value in {1×10^i, 5×10^i} for any integer i.
+
+        Examples: 0.0234 → 0.05,  0.123 → 0.1,  3.7 → 5.0,  0.0007 → 0.0005
+        """
+        if eps <= 0:
+            return eps
+        log_eps = math.log10(eps)
+        floor_log = math.floor(log_eps)
+        candidates = []
+        for i in range(floor_log - 1, floor_log + 3):
+            candidates.append(10.0 ** i)
+            candidates.append(5.0 * 10.0 ** i)
+        return min(candidates, key=lambda c: abs(math.log10(c) - log_eps))
+
+    def _auto_eps(
+        self,
+        data_loader,
+        mask: Dict,
+        explanation_type: str,
+        elimination_strategy: str,
+        default_feat_vector,
+    ) -> float:
+        """Compute eps so that task_loss ≈ eps * reg_loss at initialisation.
+
+        Runs a single no-grad forward pass on the first batch to measure both
+        loss terms, sets eps = task_loss_0 / reg_loss_0, then rounds to the
+        nearest value in {1, 5} × 10^i so the result is a clean number.
+        """
+        if explanation_type == 'filter':
+            all_params = torch.cat([mask_fi['params']['mask_vals'].detach() for mask_fi in mask.values()])
+        else:
+            all_params = torch.cat([p.detach() for p in mask.values()])
+        reg_loss_0 = all_params.sigmoid().sum().item()
+
+        batch = next(iter(data_loader))
+        batch = batch.to(self.device)
+        with torch.no_grad():
+            if explanation_type == 'filter':
+                batch_mask = {}
+                for fi, mask_fi in mask.items():
+                    nt = mask_fi['node_type']
+                    vals = mask_fi['params']['mask_vals'][mask_fi['indices'][batch[nt].n_id]]
+                    batch_mask[nt] = vals if nt not in batch_mask else torch.add(batch_mask[nt], vals)
+                batch_mask = {k: torch.clamp(v, max=1) for k, v in batch_mask.items()}
+            else:
+                batch_mask = mask
+            out = self.model_to_explain.forward_to_explain(
+                explanation_type, batch_mask, batch, self.explanation_task.entity_table,
+                elimination_strategy=elimination_strategy,
+                uninformative_feat_vector=default_feat_vector,
+            )
+            targets = batch[self.explanation_task.entity_table].y
+            out = out.view(-1) if out.size(1) == 1 else out
+            task_loss_0 = self._task_loss_fn()(out, targets).item()
+
+        eps = task_loss_0 / reg_loss_0 if reg_loss_0 > 0 else 1.0
+        eps_rounded = self._round_eps(eps)
+        print(f"[Auto-eps] task_loss_0={task_loss_0:.4f}, reg_loss_0={reg_loss_0:.2f} → eps={eps:.6f} → rounded={eps_rounded:.6g}")
+        return eps_rounded
+
     def mask_learning_loss_fn(
         self,
         eps: float = 10,
@@ -287,7 +350,7 @@ class RDLExplainer(ABC):
 
     def learn_masks(
         self,
-        eps: float = 10,
+        eps: Union[float, str] = 10,
         explanation_type: str = 'table',
         elimination_strategy: str = 'zero',
         n_epochs: int = 1000,
@@ -326,6 +389,10 @@ class RDLExplainer(ABC):
         # Move the replacement feature vectors to the device
         if default_feat_vector is not None:
             default_feat_vector = {k: v.to(self.device) for k, v in default_feat_vector.items()}
+
+        # Auto-tune eps so task_loss ≈ eps * reg_loss at initialisation
+        if eps == 'auto':
+            eps = self._auto_eps(data_loader, mask, explanation_type, elimination_strategy, default_feat_vector)
 
         # Collect the mask parameters to optimize
         if explanation_type == 'filter':
