@@ -128,6 +128,31 @@ class RelGTExplainer(RDLExplainer):
         }
         return neighbor_types, node_indices, neighbor_hops, neighbor_times, grouped_tf_dict, edge_index, batch_vec, labels
 
+    def _auto_eps(self, data_loader, mask, explanation_type, elimination_strategy, default_feat_vector) -> float:
+        """RelGT override: unpacks dict batches instead of HeteroData."""
+        all_params = torch.cat([p.detach() for p in mask.values()])
+        reg_loss_0 = all_params.sigmoid().sum().item()
+
+        batch = next(iter(data_loader))
+        (neighbor_types, node_indices, neighbor_hops, neighbor_times,
+         grouped_tf_dict, edge_index, batch_vec, targets) = self._unpack_batch(batch, self.device)
+
+        with torch.no_grad():
+            out = self.model_to_explain.forward_to_explain(
+                explanation_type, mask,
+                neighbor_types, node_indices, neighbor_hops, neighbor_times,
+                grouped_tf_dict, edge_index=edge_index, batch=batch_vec,
+                elimination_strategy=elimination_strategy,
+                uninformative_feat_vector=default_feat_vector,
+            )
+            out = out.view(-1) if out.size(1) == 1 else out
+            task_loss_0 = self._task_loss_fn()(out, targets).item()
+
+        eps = task_loss_0 / reg_loss_0 if reg_loss_0 > 0 else 1.0
+        eps_rounded = self._round_eps(eps)
+        print(f"[Auto-eps] task_loss_0={task_loss_0:.4f}, reg_loss_0={reg_loss_0:.2f} → eps={eps:.6f} → rounded={eps_rounded:.6g}")
+        return eps_rounded
+
     def learn_masks_single_epoch(
         self,
         loader,
