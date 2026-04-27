@@ -215,26 +215,26 @@ class NeighborTfsEncoder(nn.Module):
 
     def forward(self, batch_dict, neighbor_types):
         """
-    Args:
-        batch_dict (dict): A dictionary containing:
-          - grouped_tfs[t_int]: A single concatenated TorchFrame of all neighbors 
-                                for node type 't_int' in the batch.
-          - grouped_indices[t_int]: The list of flat indices corresponding to 
-                                   each row in grouped_tfs[t_int].
-          - flat_batch_idx (List[int]): The batch index 'i' for each flattened neighbor.
-          - flat_nbr_idx (List[int]): The neighbor index 'j' for each flattened neighbor.
-        neighbor_types (Tensor): A [B, K] tensor specifying the node type indices
-                                 for each neighbor in the original (batch, neighbor) shape.
+        Args:
+            batch_dict (dict): A dictionary containing:
+            - grouped_tfs[t_int]: A single concatenated TorchFrame of all neighbors 
+                                    for node type 't_int' in the batch.
+            - grouped_indices[t_int]: The list of flat indices corresponding to 
+                                    each row in grouped_tfs[t_int].
+            - flat_batch_idx (List[int]): The batch index 'i' for each flattened neighbor.
+            - flat_nbr_idx (List[int]): The neighbor index 'j' for each flattened neighbor.
+            neighbor_types (Tensor): A [B, K] tensor specifying the node type indices
+                                    for each neighbor in the original (batch, neighbor) shape.
 
-    This method performs a single-pass encoding for each node type by:
-      1) Encoding the concatenated TorchFrame (big_tf) for that type in one shot.
-      2) Scattering the resulting embeddings back to the flattened positions.
-      3) Reassembling the final [B, K, channels] tensor using 'flat_batch_idx' and 'flat_nbr_idx'.
+        This method performs a single-pass encoding for each node type by:
+        1) Encoding the concatenated TorchFrame (big_tf) for that type in one shot.
+        2) Scattering the resulting embeddings back to the flattened positions.
+        3) Reassembling the final [B, K, channels] tensor using 'flat_batch_idx' and 'flat_nbr_idx'.
 
-    Returns:
-        Tensor: A [B, K, channels] tensor of encoded neighbor features, preserving
-                the original ordering of neighbors per sample.
-    """
+        Returns:
+            Tensor: A [B, K, channels] tensor of encoded neighbor features, preserving
+                    the original ordering of neighbors per sample.
+        """
         grouped_tfs = batch_dict["grouped_tfs"]
         grouped_indices = batch_dict["grouped_indices"]
         flat_batch_idx = batch_dict["flat_batch_idx"]
