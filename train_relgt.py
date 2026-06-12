@@ -246,6 +246,21 @@ def main():
 
     task = get_task(args.dataset, args.task, download=False)
 
+    # Safeguard: the node-type names in our stored graph (data.pt, normalized to
+    # lowercase above) may not match the case of relbench's task.entity_table
+    # (e.g. 'AdsInfo' for rel-avito). If they differ only by case, reconcile to
+    # the graph's actual key so seed-node sampling doesn't raise KeyError.
+    if task.entity_table not in data.node_types:
+        ci_node_types = {nt.lower(): nt for nt in data.node_types}
+        resolved = ci_node_types.get(task.entity_table.lower())
+        if resolved is None:
+            raise KeyError(
+                f"Entity table '{task.entity_table}' not found among graph node "
+                f"types {list(data.node_types)}"
+            )
+        print(f"Reconciled entity_table '{task.entity_table}' -> '{resolved}'")
+        task.entity_table = resolved
+
     precomputed_dir = os.path.join(args.cache_dir, args.dataset, args.task)
     split_datasets = {
         split: RelGTTokens(
