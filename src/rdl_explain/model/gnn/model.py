@@ -34,7 +34,7 @@ from torch_geometric.typing import NodeType
 
 # Replace with local imports
 # from relbench.modeling.nn import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
-from rdl_explain.model.nn import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
+from .nn import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
 
 class Model(torch.nn.Module):
 
