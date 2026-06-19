@@ -51,3 +51,5 @@ cache*/
 
 # Generated artifacts (demo figures)
 figures/
+docs/
+*.pdf
