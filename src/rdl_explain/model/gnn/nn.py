@@ -26,7 +26,14 @@ import torch
 import torch_frame
 from torch import Tensor
 from torch_frame.data.stats import StatType
-from torch_geometric.nn import HeteroConv, LayerNorm, PositionalEncoding, SAGEConv
+from torch_geometric.nn import LayerNorm, PositionalEncoding
+# Custom HeteroConv / SAGEConv with a `forward_to_explain` for FKJoin (edge-level)
+# masking. Their `forward` matches the stock torch_geometric implementations, so
+# this swap is numerically equivalent and checkpoint-compatible (same submodule
+# names: lin_l / lin_r / lin, convs ModuleDict).
+from rdl_explain.model.gnn.local_hetero_conv import HeteroConv
+from rdl_explain.model.gnn.local_sage_conv import SAGEConv
+from rdl_explain.explain.explain_utils import eliminate
 from torch_geometric.typing import EdgeType, NodeType
 
 # Replace with local imports
@@ -221,6 +228,62 @@ class HeteroGraphSAGE(torch.nn.Module):
     ) -> Dict[NodeType, Tensor]:
         for _, (conv, norm_dict) in enumerate(zip(self.convs, self.norms)):
             x_dict = conv(x_dict, edge_index_dict)
+            x_dict = {key: norm_dict[key](x) for key, x in x_dict.items()}
+            x_dict = {key: x.relu() for key, x in x_dict.items()}
+
+        return x_dict
+
+    def forward_to_explain(
+        self,
+        x_dict: Dict[NodeType, Tensor],
+        edge_index_dict: Dict[NodeType, Tensor],
+        mask: Dict,
+        mask_type: str = "fkpk",
+        elimination_strategy: str = "zero",
+        num_sampled_nodes_dict: Optional[Dict[NodeType, List[int]]] = None,
+        num_sampled_edges_dict: Optional[Dict[EdgeType, List[int]]] = None,
+    ) -> Dict[NodeType, Tensor]:
+        """Message-passing forward with masking, for FKJoin / layer-wise explanations.
+
+        mask_type:
+          * 'fkpk'             — one mask value per edge type, shared across layers;
+                                 `mask` is keyed by edge_type.
+          * 'fkpk-layer-wise'  — one mask value per (edge_type, layer); `mask` is
+                                 keyed by (edge_type, layer).
+          * 'layer-wise'       — one mask per (node_type, layer) applied to node
+                                 features before each conv; `mask` is keyed by
+                                 (node_type, layer).
+        """
+        if mask_type not in ["layer-wise", "fkpk", "fkpk-layer-wise"]:
+            raise ValueError(
+                f"Invalid mask type: {mask_type}. Expected 'layer-wise', "
+                f"'fkpk', or 'fkpk-layer-wise'."
+            )
+
+        for i, (conv, norm_dict) in enumerate(zip(self.convs, self.norms)):
+            # Layer-wise node masking: eliminate masked node features before the conv.
+            if mask_type == "layer-wise":
+                for node_type in x_dict.keys():
+                    x_dict[node_type] = eliminate(
+                        x_dict[node_type], mask[(node_type, i)], elimination_strategy
+                    )
+
+            # Edge-level (FKJoin) masking happens inside the conv's forward_to_explain.
+            if mask_type == "fkpk":
+                x_dict = conv.forward_to_explain(
+                    mask, elimination_strategy, x_dict, edge_index_dict
+                )
+            elif mask_type == "fkpk-layer-wise":
+                layer_mask = {
+                    edge_type: mask[(edge_type, i)]
+                    for edge_type in edge_index_dict.keys()
+                }
+                x_dict = conv.forward_to_explain(
+                    layer_mask, elimination_strategy, x_dict, edge_index_dict
+                )
+            else:  # 'layer-wise' uses the standard conv after feature elimination
+                x_dict = conv(x_dict, edge_index_dict)
+
             x_dict = {key: norm_dict[key](x) for key, x in x_dict.items()}
             x_dict = {key: x.relu() for key, x in x_dict.items()}
 

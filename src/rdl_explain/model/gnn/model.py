@@ -187,7 +187,9 @@ class Model(torch.nn.Module):
             Tensor: Model output after applying explanation masks.
         """
 
-        if explanation_type not in ['table', 'column']:
+        feature_types = ['table', 'column']
+        message_passing_types = ['fkpk', 'fkpk-layer-wise', 'layer-wise']
+        if explanation_type not in feature_types + message_passing_types:
             raise NotImplementedError(
                 f"Explanation type {explanation_type} not implemented."
             )
@@ -197,12 +199,14 @@ class Model(torch.nn.Module):
         # Apply activation to mask
         mask = {key: value.sigmoid() for key, value in mask_dict.items()}
 
-        # Apply masks to features, for 'table' and 'column' explanations
-        if explanation_type == 'table' or explanation_type == 'column':
+        # Feature-level masking (Projection) is applied in the encoder; FKJoin /
+        # layer-wise masking is applied in the GNN (below). Encode features,
+        # masked for 'table' / 'column', standard otherwise.
+        if explanation_type in feature_types:
             # Get initial node features from encoder, applying table / column masking
             x_dict = self.encoder.forward_to_explain(batch.tf_dict, mask, mask_type=explanation_type, elimination_strategy=elimination_strategy, uninformative_feat_vector=uninformative_feat_vector)
         else:
-            # Fallback to standard encoding otherwise
+            # Standard encoding; masking happens during message passing.
             x_dict = self.encoder(batch.tf_dict)
 
         rel_time_dict = self.temporal_encoder(
@@ -215,12 +219,24 @@ class Model(torch.nn.Module):
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
 
-        x_dict = self.gnn(
-            x_dict,
-            batch.edge_index_dict,
-            batch.num_sampled_nodes_dict,
-            batch.num_sampled_edges_dict,
-        )
+        # FKJoin / layer-wise masking happens during message passing.
+        if explanation_type in message_passing_types:
+            x_dict = self.gnn.forward_to_explain(
+                x_dict,
+                batch.edge_index_dict,
+                mask,
+                mask_type=explanation_type,
+                elimination_strategy=elimination_strategy,
+                num_sampled_nodes_dict=batch.num_sampled_nodes_dict,
+                num_sampled_edges_dict=batch.num_sampled_edges_dict,
+            )
+        else:
+            x_dict = self.gnn(
+                x_dict,
+                batch.edge_index_dict,
+                batch.num_sampled_nodes_dict,
+                batch.num_sampled_edges_dict,
+            )
 
         return self.head(x_dict[entity_table][: seed_time.size(0)])
 

@@ -10,3 +10,4 @@ class ModelConfig(BaseModel):
     norm: Literal["batch_norm", "none"] = "batch_norm"
     shallow_list: List[str] = []    # List of node types to add shallow embeddings to input
     id_awareness: bool = False      # ID awareness
+    fanouts: List[int] = Field(default_factory=list)  # NeighborLoader fanouts per layer; if empty, will be set to [base_fanout // (2**i) for i in range(gnn_layers)] in ExplainerConfig

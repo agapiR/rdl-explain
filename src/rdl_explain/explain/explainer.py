@@ -1,10 +1,10 @@
-import math
 import os
 import time
 import gc
+import math
 
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Optional, List, Union
+from typing import Dict, Tuple, Optional, List
 from tqdm import tqdm
 import numpy as np
 from collections import deque
@@ -25,6 +25,8 @@ from rdl_explain.explain.explain_utils import perturb_instance, node_type_to_col
 # Relbench imports
 from relbench.base import EntityTask, TaskType
 from relbench.modeling.graph import NodeTrainTableInput, get_node_train_table_input
+from relbench.modeling.graph import AttachTargetTransform
+
 
 class RDLExplainer(ABC):
 
@@ -95,15 +97,34 @@ class RDLExplainer(ABC):
             raise ValueError(f"Unknown explanation type: '{explanation_type}'")
         return mask
 
-    def _create_loader(self, data: HeteroData, split: str, table_input: NodeTrainTableInput, shuffle: bool = False) -> NeighborLoader:
-        """Create a NeighborLoader for the given split."""
+    def _create_loader(self, data: HeteroData, split: str, table_input: NodeTrainTableInput, shuffle: bool = False, node_id_filter: Optional[Tensor] = None) -> NeighborLoader:
+        """Create a NeighborLoader for the given split.
+
+        When `node_id_filter` is provided we must filter THREE things in lock-
+        step so the target attached to each batch corresponds to the seed node:
+        input_nodes, input_time, AND the target tensor inside the transform.
+        AttachTargetTransform indexes target by `batch.input_id`, which is the
+        position in the (filtered) input-nodes list — so the target tensor
+        must be subset to the same `keep` mask, otherwise `target[input_id]`
+        returns values from arbitrary other entities.
+        """
+        input_nodes = table_input.nodes
+        input_time = table_input.time
+        transform  = table_input.transform
+        if node_id_filter is not None:
+            node_type, all_ids = input_nodes
+            keep = torch.isin(all_ids, node_id_filter.to(all_ids.device))
+            input_nodes = (node_type, all_ids[keep])
+            input_time  = input_time[keep] if input_time is not None else None
+            if table_input.target is not None:
+                transform = AttachTargetTransform(node_type, table_input.target[keep])
         return NeighborLoader(
             data,
             num_neighbors=self.config.num_neighbors,
-            time_attr="time" if table_input.time is not None else None,
-            input_nodes=table_input.nodes,
-            input_time=table_input.time,
-            transform=table_input.transform,
+            time_attr="time" if input_time is not None else None,
+            input_nodes=input_nodes,
+            input_time=input_time,
+            transform=transform,
             batch_size=self.config.inference_batch_size,
             temporal_strategy=self.config.temporal_strategy,
             shuffle=shuffle,
@@ -111,14 +132,14 @@ class RDLExplainer(ABC):
             persistent_workers=self.config.num_workers > 0,
         )
 
-    def create_loader(self, data: HeteroData, split: str, shuffle: bool = False) -> NeighborLoader:
+    def create_loader(self, data: HeteroData, split: str, shuffle: bool = False, node_id_filter: Optional[Tensor] = None) -> NeighborLoader:
         """Create data loader for the given split."""
         if split == 'train':
-            data_loader = self._create_loader(data, split, self.train_table, shuffle=shuffle)
+            data_loader = self._create_loader(data, split, self.train_table, shuffle=shuffle, node_id_filter=node_id_filter)
         elif split == 'val':
-            data_loader = self._create_loader(data, split, self.val_table, shuffle=shuffle)
+            data_loader = self._create_loader(data, split, self.val_table, shuffle=shuffle, node_id_filter=node_id_filter)
         elif split == 'test':
-            data_loader = self._create_loader(data, split, self.test_table, shuffle=shuffle)
+            data_loader = self._create_loader(data, split, self.test_table, shuffle=shuffle, node_id_filter=node_id_filter)
         else:
             raise ValueError(f"Invalid split: {split}")
         return data_loader
@@ -141,6 +162,8 @@ class RDLExplainer(ABC):
         elif self.explanation_task.task_type == TaskType.REGRESSION:
             # TODO: add clamping here?
             processed_output = output
+        else:
+            raise NotImplementedError(f"Task type {self.explanation_task.task_type} is not supported.")
         return processed_output
 
     def get_predictions(self, output: Tensor) -> Tensor:
@@ -149,10 +172,11 @@ class RDLExplainer(ABC):
             # The predicted labels column will have the label of class 0 if the predicted probability is less than prob_threshold else 1
             probs = processed_output
             prob_threshold = 0.5
-            inv_class_map_dict = {v: k for k, v in self.explanation_task.label_mapping_dict.items()}
-            pred = torch.FloatTensor([inv_class_map_dict[0] if x < prob_threshold else inv_class_map_dict[1] for x in probs])
+            pred = torch.FloatTensor([0 if x < prob_threshold else 1 for x in probs])
         elif self.explanation_task.task_type == TaskType.REGRESSION:
             pred = processed_output
+        else:
+            raise NotImplementedError(f"Task type {self.explanation_task.task_type} is not supported.")
         return pred
 
     def process_mask(self, mask: Dict, apply_activation: bool = True) -> Dict:
@@ -176,12 +200,8 @@ class RDLExplainer(ABC):
             return BCEWithLogitsLoss()
         elif self.explanation_task.task_type == TaskType.REGRESSION:
             return L1Loss()
-        elif self.explanation_task.task_type == TaskType.MULTILABEL_CLASSIFICATION:
-            return BCEWithLogitsLoss()
-        elif self.explanation_task.task_type == TaskType.MULTICLASS_CLASSIFICATION:
-            return CrossEntropyLoss()
         else:
-            raise ValueError(f"Unsupported task type: {self.task.task_type}")
+            raise NotImplementedError(f"Task type {self.explanation_task.task_type} is not supported.")
     
     def _mask_regularization_loss_fn(
         self,
@@ -207,6 +227,30 @@ class RDLExplainer(ABC):
             raise ValueError(f"Unsupported regularization type: {reg_type}")
         return reg_fn
 
+    def mask_learning_loss_fn(
+        self,
+        eps: float = 10,
+        reg_type: str = 'l1',
+        mask_size_budget: Optional[int] = None,
+    ) -> torch.nn.Module:
+        """
+        Configure the loss function for mask learning.
+        Returns loss function (torch.nn.Module)
+        """
+        task_loss_fn = self._task_loss_fn()
+        mask_regularization_loss_fn = self._mask_regularization_loss_fn(
+            reg_type=reg_type,
+            mask_size_budget=mask_size_budget,
+        )
+        
+        def loss_fn(output: Tensor, targets: Tensor, mask: Dict):
+            task_loss = task_loss_fn(output, targets)
+            reg_loss = mask_regularization_loss_fn(mask)
+            loss = task_loss + eps * reg_loss
+            return loss, task_loss.item(), reg_loss.item()
+        
+        return loss_fn
+
     @staticmethod
     def _round_eps(eps: float) -> float:
         """Round eps to the nearest value in {1×10^i, 5×10^i} for any integer i.
@@ -231,18 +275,20 @@ class RDLExplainer(ABC):
         elimination_strategy: str,
         default_feat_vector,
     ) -> float:
-        """Compute eps so that task_loss ≈ eps * reg_loss at initialisation.
+        """Compute eps so that task_loss ≈ eps * reg_loss at initialization,
+        then round to the nearest value in {1×10^i, 5×10^i}.
 
-        Runs a single no-grad forward pass on the first batch to measure both
-        loss terms, sets eps = task_loss_0 / reg_loss_0, then rounds to the
-        nearest value in {1, 5} × 10^i so the result is a clean number.
+        Runs a single no-grad forward pass on the first batch and returns
+        task_loss_0 / reg_loss_0 rounded to a nice value.
         """
+        # reg_loss at init: analytically from current mask parameter values
         if explanation_type == 'filter':
             all_params = torch.cat([mask_fi['params']['mask_vals'].detach() for mask_fi in mask.values()])
         else:
             all_params = torch.cat([p.detach() for p in mask.values()])
         reg_loss_0 = all_params.sigmoid().sum().item()
 
+        # task_loss at init: one forward pass on the first batch
         batch = next(iter(data_loader))
         batch = batch.to(self.device)
         with torch.no_grad():
@@ -268,30 +314,6 @@ class RDLExplainer(ABC):
         eps_rounded = self._round_eps(eps)
         print(f"[Auto-eps] task_loss_0={task_loss_0:.4f}, reg_loss_0={reg_loss_0:.2f} → eps={eps:.6f} → rounded={eps_rounded:.6g}")
         return eps_rounded
-
-    def mask_learning_loss_fn(
-        self,
-        eps: float = 10,
-        reg_type: str = 'l1',
-        mask_size_budget: Optional[int] = None,
-    ) -> torch.nn.Module:
-        """
-        Configure the loss function for mask learning.
-        Returns loss function (torch.nn.Module)
-        """
-        task_loss_fn = self._task_loss_fn()
-        mask_regularization_loss_fn = self._mask_regularization_loss_fn(
-            reg_type=reg_type,
-            mask_size_budget=mask_size_budget,
-        )
-        
-        def loss_fn(output: Tensor, targets: Tensor, mask: Dict):
-            task_loss = task_loss_fn(output, targets)
-            reg_loss = mask_regularization_loss_fn(mask)
-            loss = task_loss + eps * reg_loss
-            return loss, task_loss.item(), reg_loss.item()
-        
-        return loss_fn
 
     def learn_masks_single_epoch(
         self, 
@@ -350,34 +372,53 @@ class RDLExplainer(ABC):
 
     def learn_masks(
         self,
-        eps: Union[float, str] = 10,
+        eps: float | str = 10,
         explanation_type: str = 'table',
         elimination_strategy: str = 'zero',
         n_epochs: int = 1000,
         lr: float = 0.01,
         split: str = 'train',
         filter_predicates: Optional[List[Tuple[str, str, stype, str, List]]] = None,
+        # New params are keyword-only (after `*`) so the original positional
+        # signature (eps, explanation_type, elimination_strategy, n_epochs, lr,
+        # split, filter_predicates) is preserved for existing callers.
+        *,
+        n_replacement_samples: int = 2000,
+        node_id_filter: Optional[Tensor] = None,
+        mask_init_mu: float = 10,
+        mask_init_std: float = 1,
+        pinned_columns: Optional[List[Tuple[str, str]]] = None,
     ) -> Tuple[Dict, Dict]:
-        """Learn explanation masks for the given model."""
-        
+        """Learn explanation masks for the given model.
+
+        Args:
+            mask_init_mu: Mean of the Gaussian used to initialise mask logits.
+                Default 10 (sigmoid≈1, all columns start active). Use 0 to
+                initialise in the maximally sensitive sigmoid region — useful
+                when exploring multiple optima via different random seeds.
+            mask_init_std: Std of the initialisation Gaussian. Has negligible
+                effect when mask_init_mu=10 (sigmoid is saturated), but
+                produces meaningful variation when mask_init_mu≈0.
+        """
+
         start_time_for_mask_learning = time.time()
 
-        # Create data loader for the given split
-        data_loader = self.create_loader(self.data, split, shuffle=True)
+        # Create data loader for the given split (optionally restricted to a node subset)
+        data_loader = self.create_loader(self.data, split, shuffle=True, node_id_filter=node_id_filter)
 
         # Initialize masks
         if explanation_type == 'filter':
             assert filter_predicates is not None, "filter_predicates must be provided for 'filter' explanation type"
             mask = {}
             for fi, filter_predicate in enumerate(filter_predicates):
-                mask[fi] = self.initialize_masks(explanation_type, filter_predicate=filter_predicate)
+                mask[fi] = self.initialize_masks(explanation_type, mu=mask_init_mu, std=mask_init_std, filter_predicate=filter_predicate)
         else:
-            mask = self.initialize_masks(explanation_type)
+            mask = self.initialize_masks(explanation_type, mu=mask_init_mu, std=mask_init_std)
 
         # Collect the replacement feature vectors based on the elimination strategy
         if elimination_strategy in ["avg", "avg_with_noise", "permutation_joint", "permutation_independent"]:
             replacement_strategy = 'column_'+ elimination_strategy if explanation_type=='column' else 'row_' + elimination_strategy
-            default_feat_vector = self.prepare_replacement_vectors(replacement_strategy)
+            default_feat_vector = self.prepare_replacement_vectors(replacement_strategy, replacement_sample_size=n_replacement_samples)
             # Rename the elimination strategy to match the expected names in the model
             if elimination_strategy == "avg":
                 elimination_strategy = "default"
@@ -390,7 +431,7 @@ class RDLExplainer(ABC):
         if default_feat_vector is not None:
             default_feat_vector = {k: v.to(self.device) for k, v in default_feat_vector.items()}
 
-        # Auto-tune eps so task_loss ≈ eps * reg_loss at initialisation
+        # Auto-tune eps so task_loss ≈ eps * reg_loss at initialization
         if eps == 'auto':
             eps = self._auto_eps(data_loader, mask, explanation_type, elimination_strategy, default_feat_vector)
 
@@ -399,7 +440,28 @@ class RDLExplainer(ABC):
             # For filter explanation type, we only optimize the mask parameters
             parameters = [mask_fi['params']['mask_vals'] for mask_fi in mask.values()]
         else:
-            parameters = list(mask.values())
+            # Preserved-predicate mode: any (node_type, col) in `pinned_columns`
+            # has its mask logit frozen at the initialization (mask_init_mu=10
+            # → sigmoid≈1, i.e. "always keep"). The L1 reg gradient on these
+            # params is ignored because requires_grad=False, so the optimizer
+            # can't pull them down. Use this to force the mask to find what's
+            # cohort-discriminative BEYOND the predicate column.
+            if pinned_columns:
+                pinned_set = {tuple(c) for c in pinned_columns}
+                unknown = pinned_set - set(mask.keys())
+                if unknown:
+                    raise KeyError(
+                        f"pinned_columns contains keys not present in the mask: "
+                        f"{sorted(unknown)}. Available keys (first 10): "
+                        f"{list(mask.keys())[:10]}"
+                    )
+                for k in pinned_set:
+                    mask[k].requires_grad_(False)
+                parameters = [p for k, p in mask.items() if k not in pinned_set]
+                print(f"[learn_masks] pinned {len(pinned_set)} column(s): "
+                      f"{sorted(pinned_set)}")
+            else:
+                parameters = list(mask.values())
         optimizer = torch.optim.Adam(parameters, lr=lr)
 
         # Setup the loss function
@@ -411,6 +473,7 @@ class RDLExplainer(ABC):
 
         # Learn the explanation masks
         window_size = 5 # self.config.explanation_parameters.sliding_window_size, for early stopping
+        min_delta = 1e-6  # for early stopping convergence check
         sliding_window_prev = deque(maxlen=window_size)
         sliding_window = deque(maxlen=window_size)
         if explanation_type == 'filter':
@@ -438,7 +501,7 @@ class RDLExplainer(ABC):
             metrics['loss'].append(loss)
             metrics['task_loss'].append(task_loss)
             metrics['reg_loss'].append(reg_loss)
-            if epoch % int(n_epochs*0.1) == 0:
+            if epoch % max(1, int(n_epochs*0.1)) == 0:
                 print(f"Epoch {epoch}/{n_epochs}: Loss {metrics['loss'][-1]} - Task Loss {metrics['task_loss'][-1]} - Regularization {metrics['reg_loss'][-1]} - Time-per-epoch {round(end_time - start_time, 2)}s")
             # Early stopping
             if len(sliding_window_prev) < window_size:
@@ -449,7 +512,6 @@ class RDLExplainer(ABC):
                 avg_prev = sum(sliding_window_prev) / window_size
                 avg = sum(sliding_window) / window_size
                 # Check convergence
-                min_delta = 1e-6 # self.config.explanation_parameters.min_delta
                 if abs(avg_prev - avg) < min_delta:
                     print(f"Mask learning stopped early at epoch {epoch} due to convergence.")
                     break
@@ -532,12 +594,19 @@ class RDLExplainer(ABC):
         mask: Dict, # Assume hard (boolean) mask
         explanation_type: str = 'column',
         perturbation_strategy: str = 'permutation_independent',
-        num_samples: int = 1000
+        num_samples: int = 1000,
+        node_id_filter: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, List[int]]:
-        """Estimate the fidelity of the explanation masks."""
+        """Estimate the fidelity of the explanation masks.
 
-        # Collect explanation targets for the split
-        loader = self.create_loader(self.data, split, shuffle=False)
+        Args:
+            node_id_filter: If provided, restrict evaluation to this subset of prediction node IDs.
+                            The database is still perturbed globally; only predictions for these
+                            nodes are collected and used to compute fidelity.
+        """
+
+        # Collect explanation targets for the split (optionally restricted to a node subset)
+        loader = self.create_loader(self.data, split, shuffle=False, node_id_filter=node_id_filter)
         gt_list = []
         for batch in loader:
             batch = batch.to(self.device)
@@ -563,8 +632,8 @@ class RDLExplainer(ABC):
 
             start_time_for_inference = time.time()
 
-            # Create data loader for the given split and perturbed instance
-            loader = self.create_loader(self.data, split, shuffle=False)
+            # Create data loader for the given split and perturbed instance (same node subset)
+            loader = self.create_loader(self.data, split, shuffle=False, node_id_filter=node_id_filter)
 
             # Generate predictions using the perturbed instance (perform inference)
             pred_list = []
@@ -732,7 +801,7 @@ class RDLExplainer(ABC):
     def get_intermediate_encodings_for_replacement(
         self, 
         encoding_stage: str = 'column_wise', # 'column_wise' or 'fused' 
-        sample_size: Optional[int] = 1000,
+        sample_size: Optional[int] = 2000,
         average: bool = False,
     ) -> Dict[NodeType, Tensor]:
         encodings = self.inference_to_get_intermediate_encodings(encoding_stage=encoding_stage, max_sample_size=sample_size)
