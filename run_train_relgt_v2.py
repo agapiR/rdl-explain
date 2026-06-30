@@ -61,7 +61,6 @@ from torch_geometric.seed import seed_everything
 from torch_frame.data.stats import StatType
 
 from relbench.base import EntityTask, TaskType
-from relbench.tasks import get_task
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC  = os.path.join(HERE, "src")
@@ -70,6 +69,7 @@ for p in (HERE, SRC):
         sys.path.insert(0, p)
 
 from rdl_explain.model import RelGT, RelGTConfig, RelGTTokens
+from rdl_explain.loaders import load_graph_bundle, get_dataset_and_task
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -152,19 +152,6 @@ TASKS_RELGT_SMALL: Dict[str, Dict[str, Any]] = {
         "num_centroids":    4096,
         "batch_size":       64,
     },
-    "synthetic_cohort/cohort-task": {
-        # 5000 R nodes, label depends on 1-hop (S.y or T.z gated by R.x) →
-        # 2-hop sampling is more than enough; tiny centroid book.
-        "K":                100,
-        "channels":         32,
-        "global_dim":       32,
-        "local_num_layers": 1,
-        "heads":            4,
-        "ff_dropout":       0.1,
-        "attn_dropout":     0.1,
-        "num_centroids":    64,
-        "batch_size":       64,
-    },
 }
 
 
@@ -244,19 +231,6 @@ TASKS_RELGT_PAPER: Dict[str, Dict[str, Any]] = {
         "num_centroids":    4096,
         "batch_size":       256,
     },
-    "synthetic_cohort/cohort-task": {
-        # Only 5000 R nodes — the paper config's 4096 centroids on 5k entities
-        # is degenerate, so we cap at 64. Other params follow paper defaults.
-        "K":                300,
-        "channels":         128,
-        "global_dim":       128,
-        "local_num_layers": 4,
-        "heads":            4,
-        "ff_dropout":       0.4,
-        "attn_dropout":     0.4,
-        "num_centroids":    64,
-        "batch_size":       256,
-    },
 }
 
 CONFIGS: Dict[str, Dict[str, Dict[str, Any]]] = {
@@ -299,10 +273,14 @@ def _sanitize_col_stats(col_stats_dict: dict) -> dict:
 
 
 def load_v2_graph(db_name: str, task_dir_name: str) -> Tuple[HeteroData, dict]:
-    """Read the v2 graph_data.pt and return (data, col_stats_dict)."""
+    """Read the v2 graph_data.pt and return (data, col_stats_dict).
+
+    Uses the shared loader's bundle reader so RelGT runs on the exact graph the
+    GNN training (run_train_models_v2.py) built and saved.
+    """
     task_dir = os.path.join(OUT_ROOT, db_name, task_dir_name)
-    pkg = torch.load(os.path.join(task_dir, "graph_data.pt"), weights_only=False)
-    return pkg["data"], _sanitize_col_stats(pkg["col_stats_dict"])
+    data, col_stats_dict = load_graph_bundle(os.path.join(task_dir, "graph_data.pt"))
+    return data, _sanitize_col_stats(col_stats_dict)
 
 
 def task_loss_and_metric(task: EntityTask):
@@ -687,13 +665,12 @@ def run_task(
     log(f"  graph: {data}")
 
     log(f"  loading task ({db_task}) [download=False]…")
-    if db_name == "synthetic_cohort":
-        # Synthetic task — no relbench registration; use the local adapter
-        # built around ground_truth.pt that run_synthetic_cohort.py writes.
-        from rdl_explain.synthetic_task import load_task as load_synth_task
-        task = load_synth_task(os.path.join(OUT_ROOT, db_name, base_task_dir))
-    else:
-        task = get_task(db_name, task_name, download=False)
+    # Shared loader path: applies the t/f label coercion + attaches
+    # dataset_name/task_name. download_task=False avoids the stale-hash
+    # failure on some tasks (see loaders.py). The dataset is unused here
+    # (RelGT reads the graph from the bundle), so it is discarded.
+    _, task = get_dataset_and_task(
+        db_name, task_name, download_dataset=False, download_task=False)
 
     # Token cache lives under the model output dir — shared across (lr × seed).
     relgt_token_cache = os.path.join(out_dir_task, "relgt_tokens")

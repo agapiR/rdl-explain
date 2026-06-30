@@ -44,7 +44,6 @@ import os
 import shutil
 import sys
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -55,16 +54,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, L1Loss
-from torch_frame import stype
-from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.seed import seed_everything
 
 from relbench.base import EntityTask, TaskType
-from relbench.datasets import get_dataset
-from relbench.modeling.graph import get_node_train_table_input, make_pkey_fkey_graph
-from relbench.modeling.utils import get_stype_proposal
-from relbench.tasks import get_task
+from relbench.modeling.graph import get_node_train_table_input
 
 # Make the in-project modules importable
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -73,8 +67,8 @@ for p in (HERE, SRC):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from text_embedder import GloveTextEmbedding
-from rdl_explain.model.model import Model
+from rdl_explain.model import Model
+from rdl_explain.loaders import get_dataset_and_task, build_graph_from_db
 
 
 # ── Task config ───────────────────────────────────────────────────────────────
@@ -229,53 +223,23 @@ def build_graph_for_task(
         8 GB devices (rel-hm has wide text columns). This is a one-time cost
         per task; everything downstream still runs on `device`.
     """
-    log(f"  loading dataset ({db_name}) [download=True]…")
-    dataset = get_dataset(db_name, download=True)
-    log(f"  loading task ({db_name}/{task_name}) [download=False]…")
-    task    = get_task(db_name, task_name, download=False)
-
-    # Some relbench tasks store binary labels as Postgres 't'/'f' strings (e.g.
-    # rel-trial/studies-has_dmc, rel-trial/eligibilities-adult/-child). relbench's
-    # get_node_train_table_input casts the target column to float, which raises
-    # ValueError: could not convert string to float: 'f'. Coerce in-place here.
-    _TF_MAP = {"t": 1, "true": 1, "T": 1, "True": 1, "TRUE": 1,
-               "f": 0, "false": 0, "F": 0, "False": 0, "FALSE": 0,
-               "yes": 1, "Yes": 1, "no": 0, "No": 0}
-    for _split in ("train", "val", "test"):
-        try:
-            _df  = task.get_table(_split).df
-            _col = task.target_col
-        except Exception:
-            continue
-        if _col in _df.columns and _df[_col].dtype == object:
-            _mapped = _df[_col].astype(str).map(_TF_MAP)
-            if _mapped.notna().all():
-                _df[_col] = _mapped.astype(float)
-                log(f"  patched {_split}.{_col} from t/f strings → 0/1")
-
-    stypes_cache_path = Path(f"{cache_dir}/{db_name}/stypes.json")
-    if stypes_cache_path.exists():
-        with open(stypes_cache_path) as f:
-            col_to_stype_dict = json.load(f)
-        for table, mp in col_to_stype_dict.items():
-            for col, s in mp.items():
-                mp[col] = stype(s)
-    else:
-        col_to_stype_dict = get_stype_proposal(dataset.get_db())
-        stypes_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stypes_cache_path, "w") as f:
-            json.dump(col_to_stype_dict, f, indent=2, default=str)
-
-    db = dataset.get_db()
+    # Graph construction now goes through the shared loader layer
+    # (rdl_explain.loaders) so train-time and explain-time graphs are built by
+    # the SAME code path. Cache locations are kept byte-for-byte identical to the
+    # original script so previously-trained models stay consistent:
+    #   * materialized features: {cache_dir}/{db}_none/materialized
+    #   * stype proposal:        {cache_dir}/{db}/stypes.json
+    # get_dataset_and_task applies the t/f label coercion and the
+    # download_dataset=True / download_task=False split (see loaders.py).
+    log(f"  loading dataset/task ({db_name}/{task_name})…")
+    dataset, task = get_dataset_and_task(
+        db_name, task_name, download_dataset=True, download_task=False)
     log(f"  materializing graph (text embedder on CPU; cache_dir={cache_dir})…")
-    data, col_stats_dict = make_pkey_fkey_graph(
-        db,
-        col_to_stype_dict=col_to_stype_dict,
-        text_embedder_cfg=TextEmbedderConfig(
-            text_embedder=GloveTextEmbedding(device=torch.device("cpu")),
-            batch_size=256,
-        ),
-        cache_dir=f"{cache_dir}/{db_name}_none/materialized",
+    data, col_stats_dict, col_to_stype_dict = build_graph_from_db(
+        dataset,
+        cache_dir=f"{cache_dir}/{db_name}_none",
+        stype_cache_path=f"{cache_dir}/{db_name}/stypes.json",
+        text_embedder_device="cpu",
     )
     return data, col_stats_dict, task, col_to_stype_dict
 
