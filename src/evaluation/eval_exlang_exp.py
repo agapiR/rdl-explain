@@ -14,13 +14,14 @@ import torch
 from torch_frame import stype
 from collections import deque
 import matplotlib.pyplot as plt
+from torch_geometric.seed import seed_everything
 
 # Explain module imports
-from src.explain.explainer import RDLExplainer
-from src.explain.explain_utils import make_schema_graph
+from rdl_explain.explain.explainer import RDLExplainer
+from rdl_explain.explain.explain_utils import make_schema_graph
 
 # Eval imports
-from eval_utils import (initialize_explainer, 
+from evaluation.eval_utils import (initialize_explainer, 
                         estimate_fidelity_given_boolean_mask, 
                         get_time_to_learn_masks,
                         calculate_explanation_size,
@@ -362,7 +363,7 @@ if __name__ == "__main__":
     os.makedirs(args.result_dir, exist_ok=True)
 
     # Fix all seeds for reproducibility
-    fix_all_seeds(seed=int(args.seed))
+    seed_everything(int(args.seed))
 
     # Run the main function
     main(

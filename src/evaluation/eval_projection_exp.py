@@ -11,13 +11,14 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from collections import deque
+from torch_geometric.seed import seed_everything
 
 # Explain module imports
-from src.explain.explainer import RDLExplainer
-from src.explain.explain_utils import make_schema_graph
+from rdl_explain.explain.explainer import RDLExplainer
+from rdl_explain.explain.explain_utils import make_schema_graph
 
 # Eval imports
-from eval_utils import (initialize_explainer, 
+from evaluation.eval_utils import (initialize_explainer, 
                         estimate_fidelity_given_ranking, 
                         visualize_masks, 
                         visualize_predictions, 
@@ -30,7 +31,7 @@ def evaluate_masks(
     explanation_task: Any,
     explanation_type: str,
     explanation_elements_ranking: List[Any],
-    kmax: int = 10,
+    kstar: int = 10,
     n_samples: int = 10,
     perturbation_strategy: str = 'permutation_independent',
     result_dir: str = './results',
@@ -830,7 +831,7 @@ if __name__ == "__main__":
     os.makedirs(args.result_dir, exist_ok=True)
 
     # Fix all seeds for reproducibility
-    fix_all_seeds(seed=int(args.seed))
+    seed_everything(int(args.seed))
 
     # Run the main function
     main(

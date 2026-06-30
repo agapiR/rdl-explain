@@ -20,8 +20,9 @@ import networkx as nx
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_auc_score
 
 # Explain module imports
-from src.explain.explain_utils import make_schema_graph, make_schema_dag, draw_schema_dag, explanation_element_wording, prepare_node_explanation_task
-from src.explain.explainer import RDLExplainer
+from rdl_explain.explain.explain_utils import make_schema_graph, make_schema_dag, draw_schema_dag, explanation_element_wording, make_explanation_task
+from rdl_explain.explain.explainer import RDLExplainer
+from rdl_explain.loaders import load_config, load_dataset_and_task, construct_graph, load_model
 
 def calculate_explanation_size(
     boolean_mask: Dict[str, torch.Tensor],
@@ -195,11 +196,12 @@ def initialize_explainer(
     task_dir: str,
     explanation_target_type: str = 'soft',
 ) -> Tuple[RDLExplainer, str, str, Dict[str, pd.DataFrame]]:
+    # Run with PYTHONPATH=src so `rdl_explain` and `evaluation` resolve.
     # Load configuration
     config = load_config(model_config_path)
 
     # Load dataset and task
-    dataset, task, task_parser = load_dataset_and_task(data_config_path) 
+    dataset, task = load_dataset_and_task(data_config_path) 
 
     # Construct graph data
     data, col_stats_dict = construct_graph(config, dataset)
@@ -208,9 +210,8 @@ def initialize_explainer(
     # Load model
     model_to_explain = load_model(config, model_params_path, construct=True, data=data, col_stats_dict=col_stats_dict, task=task)
 
-    # Make explanation task
-    predictions= {split: pd.read_parquet(os.path.join(task_dir, f'predictions_{split}.parquet')) for split in ['train', 'val', 'test']}
-    explanation_task = prepare_node_explanation_task(task, predictions, explanation_target_type=explanation_target_type)
+    # Make explanation task (make_explanation_task reads predictions_{split}.parquet from task_dir itself)
+    explanation_task = make_explanation_task(task, data, task_dir, explanation_target_type=explanation_target_type)
     del task # Delete original task to free memory
 
     # Initialize the explainer
@@ -544,7 +545,7 @@ def construct_row_boolean_mask(
 ):
     """Evaluate explanation fidelity for provided masks."""
     print("Constructing boolean mask for rows from hard mask values...")
-    dataset_name = explanation_task.dataset.dataset_name
+    dataset_name = explanation_task.dataset_name
     task_name = explanation_task.task_name
 
     # Construct the boolean mask 

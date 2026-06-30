@@ -16,10 +16,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_auc_score
+from torch_geometric.seed import seed_everything
 
 # Explain module imports
-from src.explain.explainer import RDLExplainer
-from src.explain.explain_utils import explanation_element_wording, prepare_node_explanation_task
+from rdl_explain.explain.explainer import RDLExplainer
+from rdl_explain.loaders import load_config, load_dataset_and_task, construct_graph, load_model
+from rdl_explain.explain.explain_utils import explanation_element_wording, make_explanation_task
 
 def main(
     model_config_path: str,
@@ -35,12 +37,13 @@ def main(
     learning_rate: float = 0.1,
     suffix: str = '',
 ) -> bool:
+    # Run with PYTHONPATH=src so `rdl_explain` and `evaluation` resolve.
     # Load configuration
     config = load_config(model_config_path)
 
     # Load dataset and task
-    dataset, task, task_parser = load_dataset_and_task(data_config_path) 
-    dataset_name = task.dataset.dataset_name
+    dataset, task = load_dataset_and_task(data_config_path) 
+    dataset_name = task.dataset_name
     task_name = task.task_name
 
     # Construct graph data
@@ -50,16 +53,8 @@ def main(
     # Load model
     model_to_explain = load_model(config, model_params_path, construct=True, data=data, col_stats_dict=col_stats_dict, task=task)
 
-    # Load model predictions
-    predictions = {}
-    for split in ['train', 'val', 'test']:
-        predictions_path = os.path.join(task_dir, f'predictions_{split}.parquet')
-        if not os.path.exists(predictions_path):
-            raise FileNotFoundError(f"Predictions file not found: {predictions_path}")
-        predictions[split] = pd.read_parquet(predictions_path)
-
-    # Make explanation task
-    explanation_task = prepare_node_explanation_task(task, predictions, explanation_target_type=explanation_target_type)
+    # Make explanation task (make_explanation_task reads predictions_{split}.parquet from task_dir itself)
+    explanation_task = make_explanation_task(task, data, task_dir, explanation_target_type=explanation_target_type)
     del task # Delete original task to free memory
 
     # Initialize the explainer
@@ -109,7 +104,7 @@ if __name__ == "__main__":
     os.makedirs(args.result_dir, exist_ok=True)
 
     # Fix all seeds for reproducibility
-    fix_all_seeds(seed=int(args.seed))
+    seed_everything(int(args.seed))
 
     # Run the main function
     main(
