@@ -568,50 +568,81 @@ def _subsample_balanced(df, target_col, n, rng):
     return sampled.sample(frac=1.0, random_state=rng).reset_index(drop=True)
 
 
-def make_explanation_task(prediction_task, data, inference_dir,
+def make_explanation_task(prediction_task, data, inference_dir=None,
                           explanation_target_type='soft',
                           subsample_per_split=None,
                           subsample_balanced=True,
-                          subsample_seed=42):
-    """Clone a prediction task and substitute saved inference predictions as targets.
+                          subsample_seed=42,
+                          predictions=None):
+    """Build the *explanation task*: a clone of the model's prediction task with
+    the MODEL'S OWN predictions as the target. Mask learning and devΔ evaluation
+    therefore measure agreement with the *model*, not the labels — they are
+    label-free (original labels are kept in a ``'targets'`` column).
 
-    Reads ``predictions_train.parquet`` from *inference_dir* and sets it as
-    the DataFrame for all three splits (train / val / test).  The original
-    ground-truth labels are preserved in a ``'targets'`` column.
+    Splits. Keeps the prediction task's ``train`` / ``val`` / ``test`` (the same
+    entity instances), each now carrying the model's predictions. By default the
+    pipeline runs entirely on the **train** split: mask learning and devΔ
+    evaluation use the *same* (optionally subsampled) train instances. Evaluation
+    can be redirected to a different split only by passing it explicitly.
+
+    ``subsample_per_split`` keeps a random (optionally class-balanced) subset of N
+    instances per split — and that one subset is what both learning and
+    evaluation use. (Restricting to a specific *cohort* is a separate, opt-in
+    ``node_id_filter`` on ``learn_masks`` / the evaluator, off by default.)
+
+    Predictions come from one source (exactly one required): ``inference_dir``
+    (reads ``predictions_{split}.parquet`` / ``predictions_train.parquet``) or an
+    in-memory ``predictions`` dict
+    ``{split: {'output', 'processed_output', 'predictions'}}`` of arrays aligned
+    to ``prediction_task.get_table(split).df`` rows.
 
     Args:
-        prediction_task:        Original relbench EntityTask.
-        data:                   HeteroData graph (used only for node-type
+        prediction_task:        relbench EntityTask (defines the splits).
+        data:                   HeteroData graph (only for the entity-table
                                 capitalisation fix).
-        inference_dir:          Directory containing ``predictions_train.parquet``
-                                with columns ``predictions`` and ``processed_output``.
-        explanation_target_type: One of ``'soft'`` (use ``processed_output``),
-                                ``'hard'`` (use ``predictions``), or
-                                ``'ground_truth'`` (use original labels).
-                                Default: ``'soft'``.
+        inference_dir:          dir with prediction parquets (None if ``predictions``).
+        explanation_target_type: ``'soft'`` (``processed_output``), ``'hard'``
+                                (``predictions``), or ``'ground_truth'`` (labels).
+        subsample_per_split:    random subset size per split (None = keep all).
+        subsample_balanced:     class-balance the subsample (default True).
+        subsample_seed:         RNG seed for the subsample.
+        predictions:            in-memory predictions dict (alternative to
+                                ``inference_dir``).
 
     Returns:
-        A deep copy of *prediction_task* with tables, target column, and
-        ``entity_table`` capitalisation adjusted for explanation use.
+        A deep copy of *prediction_task* with the three split tables, target
+        column, and ``entity_table`` capitalisation set for explanation use.
     """
+    if (inference_dir is None) == (predictions is None):
+        raise ValueError("Provide exactly one of `inference_dir` or `predictions`.")
+
     explanation_task = copy.deepcopy(prediction_task)
     target_col_original = prediction_task.target_col   # used for balance
 
     rng = np.random.default_rng(subsample_seed) if subsample_per_split else None
 
     def _load_one(split):
-        """Load per-split parquet if it exists (v2 layout), else fall back to
-        predictions_train.parquet (v1 layout)."""
-        path = os.path.join(inference_dir, f'predictions_{split}.parquet')
-        if not os.path.exists(path):
-            path = os.path.join(inference_dir, 'predictions_train.parquet')
-        df = pd.read_parquet(path)
-
-        # v2 layout writes a single 'prediction' column with the sigmoid output;
-        # derive the two column names the rest of this function expects.
-        if 'prediction' in df.columns and 'predictions' not in df.columns:
-            df['processed_output'] = df['prediction'].astype(float)
-            df['predictions']      = (df['prediction'] >= 0.5).astype(int)
+        """Build the per-split prediction frame from in-memory `predictions` or
+        from a parquet (v2 per-split layout, else v1 predictions_train.parquet)."""
+        if predictions is not None:
+            # In-memory: the task table rows + the prediction arrays.
+            df = prediction_task.get_table(split).df.copy()
+            p = predictions[split]
+            df['output']           = p['output']
+            df['processed_output'] = p['processed_output']
+            df['predictions']      = p['predictions']
+            src_label = f'{split} (in-memory)'
+        else:
+            path = os.path.join(inference_dir, f'predictions_{split}.parquet')
+            if not os.path.exists(path):
+                path = os.path.join(inference_dir, 'predictions_train.parquet')
+            df = pd.read_parquet(path)
+            # v2 layout writes a single 'prediction' column with the sigmoid
+            # output; derive the two column names the rest of this expects.
+            if 'prediction' in df.columns and 'predictions' not in df.columns:
+                df['processed_output'] = df['prediction'].astype(float)
+                df['predictions']      = (df['prediction'] >= 0.5).astype(int)
+            src_label = os.path.basename(path)
 
         # pyarrow may serialize timestamp columns at [ms] resolution by default
         # when the source pd.Series was a single Timestamp broadcast across rows.
@@ -633,7 +664,7 @@ def make_explanation_task(prediction_task, data, inference_dir,
                     balance_col = target_col_original
                 elif 'predictions' in df.columns:
                     balance_col = 'predictions'
-                    print(f'    note: {os.path.basename(path)} has no '
+                    print(f'    note: {src_label} has no '
                           f'{target_col_original!r} column (labels hidden); '
                           f'balancing subsample by model "predictions" instead.')
             if balance_col is not None:
