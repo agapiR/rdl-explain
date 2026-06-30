@@ -26,7 +26,9 @@ from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import matplotlib.pyplot as plt
 
+from rdl_explain.explain.explain_utils import explanation_element_wording
 from rdl_explain.explain.explain_utils import node_type_to_col_names, make_schema_dag
 
 
@@ -153,6 +155,74 @@ def _edge_style(v: float, used: bool, delta: float):
     if v >= delta:
         return _ramp(v, base=(214, 39, 40)), str(1 + 4 * v), "solid"
     return "#999999", "1", "solid"
+
+
+# ── mask importance bar chart ────────────────────────────────────────────────
+
+def plot_mask_importances(
+    mask,
+    *,
+    delta: float = 0.1,
+    title: Optional[str] = None,
+    top_k: Optional[int] = None,
+    label_fn=None,
+    save_path: Optional[str] = None,
+    figsize=None,
+):
+    """Horizontal bar chart of per-element mask importances.
+
+    Works for ANY learned mask dict — column masks (keys ``(table, col)``) or
+    fkpk masks (keys = edge types). Values may be soft floats in [0, 1] or raw
+    logit tensors (sigmoid is applied). Bars at/above ``delta`` are shaded by
+    value (same orange scale as the schema viz); the rest are gray. A dashed line
+    marks the threshold.
+
+    Args:
+        mask:      ``{element_key: value}`` learned mask.
+        delta:     importance threshold.
+        title:     plot title (a "k/n above δ" summary is appended).
+        top_k:     show only the top-k elements by importance (None = all).
+        label_fn:  ``key -> str`` for axis labels (default:
+                   ``explanation_element_wording`` with a ``str()`` fallback).
+        save_path: if given, save the figure there.
+        figsize:   matplotlib figsize (default scales with the element count).
+
+    Returns:
+        ``(fig, ax)``.
+    """
+    if label_fn is None:
+        def label_fn(k):
+            try:
+                return explanation_element_wording(k)
+            except Exception:
+                return str(k)
+
+    items = sorted(((label_fn(k), _to_float(v)) for k, v in mask.items()),
+                   key=lambda t: t[1], reverse=True)
+    if top_k is not None:
+        items = items[:top_k]
+    labels = [lbl for lbl, _ in items]
+    scores = [s for _, s in items]
+    n = len(items)
+    n_imp = sum(s >= delta for s in scores)
+
+    if figsize is None:
+        figsize = (8, max(2.0, 0.22 * n))
+    fig, ax = plt.subplots(figsize=figsize)
+    colors = [_ramp(s) if s >= delta else "#dddddd" for s in scores]
+    ax.barh(labels, scores, color=colors, edgecolor="#999999", linewidth=0.4)
+    ax.axvline(delta, color="red", linestyle="--", linewidth=1,
+               label=f"δ = {delta}")
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("mask value (importance)")
+    ax.invert_yaxis()                      # highest importance on top
+    ax.legend(loc="lower right", fontsize=8)
+    ttl = title or "RDL explanation — mask importances"
+    ax.set_title(f"{ttl}\n{n_imp}/{n} above δ={delta}", fontsize=10)
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight", dpi=130)
+    return fig, ax
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
