@@ -51,6 +51,7 @@ cache*/
 
 # Generated artifacts (demo figures)
 figures/
+new_scripts/
 docs/
 *.pdf
 *.md
