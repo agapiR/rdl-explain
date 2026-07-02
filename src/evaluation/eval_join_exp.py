@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 from collections import deque
 from torch_geometric.seed import seed_everything
+from relbench.base import TaskType
 
 # Explain module imports
 from rdl_explain.explain.explainer import RDLExplainer
@@ -89,7 +90,7 @@ def evaluate_masks(
     explanation_type: str,
     explanation_elements_ranking: List[Any],
     schema_graph: Dict[str, List],
-    kmax: int,
+    kstar: int,
     n_samples: int = 10,
     perturbation_strategy: str = 'foreign_key_exchange',
     result_dir: str = './results',
@@ -104,21 +105,21 @@ def evaluate_masks(
     prediction_entity = explanation_task.entity_table
     if prediction_entity not in schema_graph:
         raise ValueError(f"Prediction entity {prediction_entity} not found in schema graph.")
-    is_connected, mask_top_kmax_edges = is_schema_subgraph_connected(schema_graph, edges_to_keep=explanation_elements_ranking[:(kmax*2)], prediction_entity=prediction_entity)
+    is_connected, mask_top_kmax_edges = is_schema_subgraph_connected(schema_graph, edges_to_keep=explanation_elements_ranking[:(kstar*2)], prediction_entity=prediction_entity)
     if not is_connected:
-        print(f"The top-{kmax} explanation elements do not form a connected subgraph in the schema graph starting from the prediction entity {prediction_entity}. Reducing the top-k elements to only those that form a connected subgraph.")
+        print(f"The top-{kstar} explanation elements do not form a connected subgraph in the schema graph starting from the prediction entity {prediction_entity}. Reducing the top-k elements to only those that form a connected subgraph.")
     else:
-        print(f"The top-{kmax} explanation elements form a connected subgraph in the schema graph starting from the prediction entity {prediction_entity}. Traversal order: {mask_top_kmax_edges}")
+        print(f"The top-{kstar} explanation elements form a connected subgraph in the schema graph starting from the prediction entity {prediction_entity}. Traversal order: {mask_top_kmax_edges}")
 
     mask_top_kmax_edges_only_f2p = [e for e in mask_top_kmax_edges if e in mask_keys_only_f2p_ranking]
     remaining_edges_only_f2p_sorted_by_explanation_elements_ranking = [e for e in mask_keys_only_f2p_ranking if e not in mask_top_kmax_edges_only_f2p]
     mask_keys_only_f2p_new_ranking = mask_top_kmax_edges_only_f2p + remaining_edges_only_f2p_sorted_by_explanation_elements_ranking
     explanation_elements_ranking = mask_keys_only_f2p_new_ranking + mask_keys_only_rev_f2p_ranking
 
-    print(f"Using the following explanation elements ranking for fidelity estimation: {explanation_elements_ranking[:kmax]}...")
+    print(f"Using the following explanation elements ranking for fidelity estimation: {explanation_elements_ranking[:kstar]}...")
 
     # TODO: set k-list externally
-    klist = [k for k in range(0, kmax+2) if k <= len(mask_keys_only_f2p_new_ranking)]
+    klist = [k for k in range(0, kstar+2) if k <= len(mask_keys_only_f2p_new_ranking)]
 
     # Estimate fidelity using the explanation elements ranking
     fidelity_results, masked_predictions = estimate_fidelity_given_ranking(
@@ -403,19 +404,19 @@ def evaluate_random_expansion_baseline(
 
 #     return fidelity_results
 
-# def evaluate_random_dfs_baseline(
-#     explainer: RDLExplainer,
-#     explanation_task: Any,
-#     explanation_type: str,
-#     schema_graph: Dict[str, List],
-#     kmax: int,
-#     klist: List[int],
-#     n_samples: int = 10,
-#     perturbation_strategy: str = 'foreign_key_exchange',
-#     result_dir: str = './results',
-#     suffix: str = '',
-#     reps: int = 5,
-# ) -> Tuple[Dict[str, Any], List[Tuple[str, str, str]]]:
+def evaluate_random_dfs_baseline(
+    explainer: RDLExplainer,
+    explanation_task: Any,
+    explanation_type: str,
+    schema_graph: Dict[str, List],
+    kmax: int,
+    klist: List[int],
+    n_samples: int = 10,
+    perturbation_strategy: str = 'foreign_key_exchange',
+    result_dir: str = './results',
+    suffix: str = '',
+    reps: int = 5,
+) -> Tuple[Dict[str, Any], List[Tuple[str, str, str]]]:
     """Evaluate fidelity for random DFS expansion baseline."""
     print("Evaluating random DFS expansion baseline...")
 
@@ -557,7 +558,7 @@ def evaluate_greedy_expansion_baseline(
                 greedy_expansion_res = json.load(f)
                 greedy_top_kmax_edges = [tuple(e) for e in greedy_expansion_res['explanation_elements_ranking']]
         except FileNotFoundError:
-            raise FileNotFoundError(f"Greedy subset source file not found: {greedy_subset_source}")
+            raise FileNotFoundError(f"Greedy subset source file not found: {greedy_expansion_source}")
     else:
         while len(greedy_top_kmax_edges) < kmax:
             if not current_edges:
@@ -704,7 +705,7 @@ def main(
     # Compute fidelity for explanation masks
     fidelity_results_from_masks_file = os.path.join(result_dir, f'{dataset_name}-{task_name}-{explanation_type}_mask-fidelity_results.json')    
     if run_evaluation and not os.path.exists(fidelity_results_from_masks_file):
-        evaluate_masks(explainer, explanation_task, explanation_type, mask_key_ranking, schema_graph, kmax=kstar_only_f2p, n_samples=n_fidelity_estimation_samples, perturbation_strategy=perturbation_strategy, result_dir=result_dir)
+        evaluate_masks(explainer, explanation_task, explanation_type, mask_key_ranking, schema_graph, kstar=kstar_only_f2p, n_samples=n_fidelity_estimation_samples, perturbation_strategy=perturbation_strategy, result_dir=result_dir)
     if os.path.exists(fidelity_results_from_masks_file):
         with open(fidelity_results_from_masks_file, 'r') as f:
             fidelity_results = json.load(f)

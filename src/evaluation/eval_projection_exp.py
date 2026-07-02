@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 from collections import deque
 from torch_geometric.seed import seed_everything
+from relbench.base import TaskType
 
 # Explain module imports
 from rdl_explain.explain.explainer import RDLExplainer
