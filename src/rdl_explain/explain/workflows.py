@@ -227,7 +227,7 @@ def compute_dev_and_cost(
     )
     mask_dict = _hard_to_mask_dict(col_keys, hard)
 
-    dev_delta, dev_sem, per_inst_dev, _, _, _ = estimate_deviation_from_determinacy(
+    dev_delta, dev_sem, per_inst_dev, _, _, _, _ = estimate_deviation_from_determinacy(
         model=explainer.model_to_explain,
         data=explainer.data,
         task=explainer.explanation_task,

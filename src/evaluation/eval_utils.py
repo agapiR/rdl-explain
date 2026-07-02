@@ -90,6 +90,21 @@ def calculate_explanation_size(
     }
     return size_stats
 
+
+def dev_to_fidelity(dev):
+    """Convert deviation-from-determinacy (devΔ) to fidelity: ``1 - devΔ``.
+    Works on scalars or numpy arrays.
+
+    devΔ is the paper's metric (lower = better). Fidelity (higher = better) is
+    kept in this module because the eval baselines (greedy / random expansion)
+    SELECT explanation elements by highest fidelity — their logic needs the
+    positive measure, not devΔ. The helpers below therefore estimate devΔ (via
+    the explainer's estimate_devdelta / eval.estimate_deviation_from_determinacy)
+    and flip it to fidelity so the rest of the eval_* pipeline is unchanged.
+    """
+    return 1.0 - dev
+
+
 def estimate_fidelity_given_boolean_mask(
     explainer: RDLExplainer,
     explanation_task: Any,
@@ -108,14 +123,19 @@ def estimate_fidelity_given_boolean_mask(
     # initialize perturbed prediction results
     predictions = {split: {} for split in splits}
             
-    # estimate the fidelity for the mask
+    # Estimate devΔ for the mask, then flip to fidelity (1 - devΔ). See
+    # dev_to_fidelity() for why fidelity (not devΔ) is the reported/returned value.
     for split in splits:
-        fid, fid_std, pred, target = explainer.estimate_fidelity(split, boolean_mask, explanation_type=explanation_type, perturbation_strategy=perturbation_strategy, num_samples=n_samples)
+        dev, dev_sem, _, _, _, orig_preds, pert_preds = explainer.estimate_devdelta(
+            boolean_mask, split=split, explanation_type=explanation_type,
+            perturbation_strategy=perturbation_strategy, num_samples=n_samples)
+        fid = dev_to_fidelity(dev)          # fidelity = 1 - devΔ
+        fid_std = dev_sem                   # SEM unchanged by the 1-dev shift
         fidelity[split] = fid
         fidelity_var[split] = fid_std
-        predictions[split]['predictions_per_sample'] = pred
-        predictions[split]['targets'] = target  
-        print(f"Estimated fidelity: {fid:.4f} +/- {fid_std:.4f} {split}")         
+        predictions[split]['predictions_per_sample'] = pert_preds        # (S, N) perturbed preds
+        predictions[split]['targets'] = orig_preds.mean(axis=0)          # (N,) reference preds
+        print(f"Estimated fidelity: {fid:.4f} +/- {fid_std:.4f} {split} (devΔ={dev:.4f})")
 
     # Fidelity results
     fidelity_results = {
@@ -169,15 +189,19 @@ def estimate_fidelity_given_ranking(
             else:
                 hard_mask_top_k[e] = torch.tensor([False])
         
-        # estimate the fidelity for the top-k elements
+        # estimate devΔ for the top-k elements, then flip to fidelity (1 - devΔ)
         for split in splits:
-            fid, fid_std, pred, target = explainer.estimate_fidelity(split, hard_mask_top_k, explanation_type=explanation_type, perturbation_strategy=perturbation_strategy, num_samples=n_samples)
+            dev, dev_sem, _, _, _, orig_preds, pert_preds = explainer.estimate_devdelta(
+                hard_mask_top_k, split=split, explanation_type=explanation_type,
+                perturbation_strategy=perturbation_strategy, num_samples=n_samples)
+            fid = dev_to_fidelity(dev)          # fidelity = 1 - devΔ
+            fid_std = dev_sem
             fidelity_top_k[split].append(fid)
             fidelity_var_top_k[split].append(fid_std)
-            print(f"Top-{k} elements: {fid:.4f} +/- {fid_std:.4f} {split} fidelity")     
-            # save the predictions for the last top-k 
-            predictions[split]['predictions_per_sample'] = pred
-            predictions[split]['targets'] = target           
+            print(f"Top-{k} elements: {fid:.4f} +/- {fid_std:.4f} {split} fidelity (devΔ={dev:.4f})")
+            # save the predictions for the last top-k
+            predictions[split]['predictions_per_sample'] = pert_preds
+            predictions[split]['targets'] = orig_preds.mean(axis=0)
 
     # Fidelity results
     fidelity_results = {

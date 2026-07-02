@@ -1,6 +1,4 @@
-import os
 import time
-import gc
 import math
 
 from abc import ABC, abstractmethod
@@ -20,7 +18,8 @@ from torch_frame import stype
 from torch_frame.data import DataLoader as TensorFrameDataLoader
 
 # Explain module imports
-from rdl_explain.explain.explain_utils import perturb_instance, node_type_to_col_names, node_type_to_col_names_by_stype
+from rdl_explain.explain.explain_utils import node_type_to_col_names, node_type_to_col_names_by_stype
+from rdl_explain.explain.eval import estimate_deviation_from_determinacy
 
 # Relbench imports
 from relbench.base import EntityTask, TaskType
@@ -550,136 +549,54 @@ class RDLExplainer(ABC):
             raise ValueError(f"Unknown elimination strategy: {replacement_strategy}")
         return replacement_vectors
 
-    def _calculate_fidelity(
-        self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
-        distance_metric: str = 'abs_percentage_change', 
-        # TODO: add 'cross_entropy' / 'kl_divergence'
-    ):
-        n_sample, n_instances = predictions.shape
-        assert n_instances == len(targets), "Number of instances in predictions must match the number of targets provided."
-        distance = np.empty((n_sample, n_instances))
-        for i in range(n_sample):
-            if distance_metric == 'equality':
-                dist = 1.0 - (predictions[i] == targets)
-                distance[i] = dist
-            elif distance_metric == 'abs_difference':
-                assert np.all(predictions[i] >= 0) and np.all(predictions[i] <= 1), "Predictions must be in the range [0, 1]."
-                assert np.all(targets >= 0) and np.all(targets <= 1), "Targets must be in the range [0, 1]."
-                dist = np.abs(predictions[i] - targets)
-                distance[i] = dist
-            elif distance_metric == 'abs_percentage_change':
-                dist = np.abs(predictions[i] - targets) / (np.abs(targets) + 1e-8)
-                distance[i] = dist
-            elif distance_metric == 'symmetric_mean_absolute_percentage_change':
-                dist = np.abs(predictions[i] - targets) / ((np.abs(predictions[i]) + np.abs(targets)) / 2 + 1e-8)
-                distance[i] = dist
-            else:
-                raise ValueError(f"Unknown distance metric: {distance_metric}")
-        # average deviation across D' instances for each s
-        dev_s = np.sum(distance, axis=0) / n_sample # empirical mean
-        fid_s = 1.0 - dev_s
-        fid_s_std = np.std(distance, axis=0)
-        assert fid_s.shape[0] == len(targets) # one fidelity score and variance per instance
-        # average fidelity score across all s
-        fid_mean = np.mean(fid_s) 
-        fid_std = np.sqrt(np.sum(fid_s_std**2)) / n_instances # empirical std
-        return fid_mean, fid_std
-
     @torch.no_grad()
-    def estimate_fidelity(
+    def estimate_devdelta(
         self,
-        split: str,
-        mask: Dict, # Assume hard (boolean) mask
+        mask: Dict,
+        split: str = 'train',
         explanation_type: str = 'column',
         perturbation_strategy: str = 'permutation_independent',
-        num_samples: int = 1000,
+        num_samples: int = 100,
         node_id_filter: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, List[int]]:
-        """Estimate the fidelity of the explanation masks.
+        prediction_type: str = 'soft',
+        random_seed: Optional[int] = None,
+    ):
+        """Estimate deviation from determinacy (devΔ) for a (hard) mask.
 
-        Args:
-            node_id_filter: If provided, restrict evaluation to this subset of prediction node IDs.
-                            The database is still perturbed globally; only predictions for these
-                            nodes are collected and used to compute fidelity.
+        devΔ is the paper's evaluation metric: lower ⇒ the explanation better
+        determines the model's predictions (label-free — it compares the model's
+        predictions on the original vs. perturbed database). This is a thin
+        wrapper around ``estimate_deviation_from_determinacy`` (in
+        ``rdl_explain.explain.eval``), which holds the corrected estimator
+        (fresh-inference reference, cross-sample SEM, abs-diff / SMAPE-2 distance).
+
+        By default it evaluates on the ``train`` split — the SAME instances used
+        for mask learning (``learn_masks`` also defaults to ``'train'``). Pass a
+        different ``split`` (or a ``node_id_filter``) to evaluate elsewhere.
+
+        Returns ``(dev_delta, dev_sem, per_instance_dev, per_instance_dev_std,
+        per_sample_mean_distances, original_predictions)`` — see
+        ``estimate_deviation_from_determinacy``.
         """
-
-        # Collect explanation targets for the split (optionally restricted to a node subset)
-        loader = self.create_loader(self.data, split, shuffle=False, node_id_filter=node_id_filter)
-        gt_list = []
-        for batch in loader:
-            batch = batch.to(self.device)
-            gt_list.append(batch[self.explanation_task.entity_table].y.detach().cpu())
-        targets = torch.cat(gt_list, dim=0).numpy()
-
-        # Initialize predictions array
-        predictions_per_sample = np.empty((num_samples, len(targets)))
-
-        start_time = time.time()
-
-        # Save the original data to a backup file
-        start_time_to_store = time.time()
-        cache_id = np.random.randint(0, 1000000)
-        torch.save(self.data, f'graph_data_backup_{cache_id}.pt')
-        end_time_to_store = time.time()
-        print(f"Original data stored in backup file 'graph_data_backup_{cache_id}.pt' in {round(end_time_to_store - start_time_to_store, 2)} seconds.")
-
-        # Iterate over the number of samples
-        for i in range(num_samples):
-            # Create perturbed data instance applying the mask
-            self.data = perturb_instance(self.data, mask, mask_type=explanation_type, perturbation_type=perturbation_strategy)
-
-            start_time_for_inference = time.time()
-
-            # Create data loader for the given split and perturbed instance (same node subset)
-            loader = self.create_loader(self.data, split, shuffle=False, node_id_filter=node_id_filter)
-
-            # Generate predictions using the perturbed instance (perform inference)
-            pred_list = []
-            for batch in loader:
-                batch = batch.to(self.device)
-                out = self.model_to_explain(batch, self.explanation_task.entity_table)
-                out = out.view(-1) if out.size(1) == 1 else out
-                if self.explanation_task.explanation_target_type == 'soft':
-                    pred = self.process_output(out)
-                elif self.explanation_task.explanation_target_type == 'hard':
-                    pred = self.get_predictions(out)
-                pred_list.append(pred.detach().cpu())
-
-            # Store the predictions for the current sample
-            predictions_per_sample[i] = torch.cat(pred_list, dim=0).numpy()
-
-            end_time_for_inference = time.time()
-            print(f"Successfully generated predictions ({len(targets)}) for perturbed instance. Elapsed time: {round(end_time_for_inference - start_time_for_inference, 2)} seconds.")
-            
-
-        # Load the original data back from the backup file
-        start_time_to_load = time.time()
-        gc.collect()
-        self.data = torch.load(f'graph_data_backup_{cache_id}.pt', weights_only=False)
-        end_time_to_load = time.time()
-        print(f"Original data restored from backup file 'graph_data_backup_{cache_id}.pt' in {round(end_time_to_load - start_time_to_load, 2)} seconds.")
-
-        end_time = time.time()
-
-        # Delete the backup file
-        try:
-            os.remove(f'graph_data_backup_{cache_id}.pt')
-        except Exception as e:
-            print(f"Failed to delete backup file: {e}")
-
-        # Compare the predictions with the original predictions to estimate fidelity
-        fid_mean, fid_std = self._calculate_fidelity(
-            predictions=predictions_per_sample,
-            targets=targets,
-            distance_metric='abs_difference' if self.explanation_task.task_type == TaskType.BINARY_CLASSIFICATION else 'symmetric_mean_absolute_percentage_change',
+        node_ids = node_id_filter
+        if node_ids is not None and not torch.is_tensor(node_ids):
+            node_ids = torch.as_tensor(node_ids)
+        loader_factory = lambda: self.create_loader(
+            self.data, split, shuffle=False, node_id_filter=node_ids)
+        return estimate_deviation_from_determinacy(
+            model=self.model_to_explain,
+            data=self.data,
+            task=self.explanation_task,
+            mask=mask,
+            loader_factory=loader_factory,
+            explanation_type=explanation_type,
+            perturbation_strategy=perturbation_strategy,
+            num_samples=num_samples,
+            prediction_type=prediction_type,
+            device=str(self.device),
+            random_seed=random_seed,
         )
 
-        print(f"Fidelity estimation with {num_samples} samples completed. Total time elapsed: {round(end_time - start_time, 2)} seconds.")
-
-        return fid_mean, fid_std, predictions_per_sample, targets
-    
     @torch.no_grad()
     def inference_to_explain_predictions(
         self,

@@ -86,7 +86,7 @@ def run_with_patches(model, data, task, mask, loader_factory, **kwargs):
 # ---------------------------------------------------------------------------
 
 def test_output_shapes_binary_classification():
-    """All six return values have correct types and shapes."""
+    """All seven return values have correct types and shapes."""
     task = SimpleNamespace(
         task_type=TaskType.BINARY_CLASSIFICATION,
         entity_table='entity',
@@ -98,7 +98,7 @@ def test_output_shapes_binary_classification():
     data   = make_mock_data()
     loader = make_loader(N_BATCHES)
 
-    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, orig_preds = run_with_patches(
+    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, orig_preds, pert_preds = run_with_patches(
         model, data, task, mask={}, loader_factory=lambda: loader,
         num_samples=N_SAMPLES, prediction_type='soft',
     )
@@ -108,7 +108,8 @@ def test_output_shapes_binary_classification():
     assert per_inst_dev.shape  == (N_INSTANCES,), f"expected ({N_INSTANCES},), got {per_inst_dev.shape}"
     assert per_inst_std.shape  == (N_INSTANCES,), f"expected ({N_INSTANCES},), got {per_inst_std.shape}"
     assert per_sample.shape    == (N_SAMPLES,),   f"expected ({N_SAMPLES},), got {per_sample.shape}"
-    assert orig_preds.shape    == (N_INSTANCES,), f"expected ({N_INSTANCES},), got {orig_preds.shape}"
+    assert orig_preds.shape    == (N_SAMPLES, N_INSTANCES), f"expected ({N_SAMPLES}, {N_INSTANCES}), got {orig_preds.shape}"
+    assert pert_preds.shape    == (N_SAMPLES, N_INSTANCES), f"expected ({N_SAMPLES}, {N_INSTANCES}), got {pert_preds.shape}"
     print("PASS: test_output_shapes_binary_classification")
 
 
@@ -121,7 +122,7 @@ def test_dev_delta_in_range_binary_classification():
     n_calls = N_BATCHES * 2 * N_SAMPLES
     outputs = [torch.randn(BATCH_SIZE, 1) for _ in range(n_calls)]
 
-    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, orig_preds = run_with_patches(
+    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, orig_preds, _ = run_with_patches(
         make_mock_model(outputs), make_mock_data(), task, mask={},
         loader_factory=lambda: make_loader(N_BATCHES), num_samples=N_SAMPLES,
     )
@@ -144,7 +145,7 @@ def test_aggregate_consistency():
     n_calls = N_BATCHES * 2 * N_SAMPLES
     outputs = [torch.randn(BATCH_SIZE, 1) for _ in range(n_calls)]
 
-    dev_delta, dev_std, per_inst_dev, _, per_sample, _ = run_with_patches(
+    dev_delta, dev_std, per_inst_dev, _, per_sample, *_ = run_with_patches(
         make_mock_model(outputs), make_mock_data(), task, mask={},
         loader_factory=lambda: make_loader(N_BATCHES), num_samples=N_SAMPLES,
     )
@@ -167,7 +168,7 @@ def test_zero_devdelta_when_predictions_unchanged():
     n_calls = N_BATCHES * 2 * N_SAMPLES
     outputs = [fixed_logit.clone() for _ in range(n_calls)]
 
-    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, _ = run_with_patches(
+    dev_delta, dev_std, per_inst_dev, per_inst_std, per_sample, *_ = run_with_patches(
         make_mock_model(outputs), make_mock_data(), task, mask={},
         loader_factory=lambda: make_loader(N_BATCHES), num_samples=N_SAMPLES,
     )
@@ -188,7 +189,7 @@ def test_regression_smape_range():
     # Positive-valued regression outputs to exercise SMAPE
     outputs = [torch.rand(BATCH_SIZE, 1) * 10 for _ in range(n_calls)]
 
-    dev_delta, dev_std, per_inst_dev, _, per_sample, _ = run_with_patches(
+    dev_delta, dev_std, per_inst_dev, _, per_sample, *_ = run_with_patches(
         make_mock_model(outputs), make_mock_data(), task, mask={},
         loader_factory=lambda: make_loader(N_BATCHES), num_samples=N_SAMPLES,
     )
@@ -332,7 +333,7 @@ def test_integration_retain_signal_gives_zero_devdelta():
         ('entity', 'noise'):  torch.tensor(False, dtype=torch.bool),
     }
 
-    dev_delta, _, per_inst_dev, _, per_sample, _ = \
+    dev_delta, _, per_inst_dev, _, per_sample, *_ = \
         estimate_deviation_from_determinacy(
             model=model, data=data, task=task, mask=mask, loader_factory=loader_factory,
             explanation_type='column',
@@ -373,7 +374,7 @@ def test_integration_perturb_signal_gives_positive_devdelta():
         ('entity', 'noise'):  torch.tensor(True,  dtype=torch.bool),
     }
 
-    dev_delta, dev_std, _, _, per_sample, _ = \
+    dev_delta, dev_std, _, _, per_sample, *_ = \
         estimate_deviation_from_determinacy(
             model=model, data=data, task=task, mask=mask, loader_factory=loader_factory,
             explanation_type='column',

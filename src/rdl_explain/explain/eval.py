@@ -93,8 +93,14 @@ def estimate_deviation_from_determinacy(
                                     = std_s(d_{s,i}).
         per_sample_mean_distances:  (S,) per-perturbation mean distance
                                     m_s = (1/N) Σ_i d_{s,i}.
-        original_predictions:       (N,) mean of per-draw original predictions
-                                    (1/S) Σ_s ŷ_{s,i}, averaged to reduce subgraph noise.
+        original_predictions:       (S, N) the model's predictions on the ORIGINAL
+                                    (unperturbed) database for each draw s and
+                                    instance i, i.e. ŷ_{s,i}. Raw per-draw (draws
+                                    differ only by subgraph sampling).
+        perturbed_predictions:      (S, N) the model's predictions on the PERTURBED
+                                    database for each draw s and instance i, i.e.
+                                    ŷ'_{s,i}. Raw per-draw, same shape as
+                                    original_predictions.
     """
     if prediction_type == 'ground_truth':
         raise ValueError(
@@ -188,19 +194,21 @@ def estimate_deviation_from_determinacy(
 
     # --- Step 2: paired perturbation loop ---
     # Discover N from the first original pass; allocate arrays after.
-    orig_preds_all = None   # (S, N) — original predictions per draw
-    distance       = None   # (S, N) — per-draw per-instance distances
+    original_predictions  = None   # (S, N) — original predictions per draw
+    perturbed_predictions = None   # (S, N) — perturbed predictions per draw
+    distance              = None   # (S, N) — per-draw per-instance distances
 
     for s in range(num_samples):
         # Original inference — fix seed so NeighborLoader uses a known subgraph.
         torch.manual_seed(int(seeds[s]))
         orig_s = _run_inference(loader_factory())
 
-        if orig_preds_all is None:
+        if original_predictions is None:
             N = len(orig_s)
-            orig_preds_all = np.empty((num_samples, N), dtype=np.float32)
-            distance       = np.empty((num_samples, N), dtype=np.float32)
-        orig_preds_all[s] = orig_s
+            original_predictions  = np.empty((num_samples, N), dtype=np.float32)
+            perturbed_predictions = np.empty((num_samples, N), dtype=np.float32)
+            distance              = np.empty((num_samples, N), dtype=np.float32)
+        original_predictions[s] = orig_s
 
         # Perturbation — consumes whatever torch RNG state remains after inference.
         perturb_instance(
@@ -210,9 +218,12 @@ def estimate_deviation_from_determinacy(
         )
 
         # Perturbed inference — reset to the same seed so the loader samples the
-        # same subgraph it used for the original inference above.
+        # same subgraph it used for the original inference above. These are the
+        # model's predictions on the PERTURBED database for draw s.
         torch.manual_seed(int(seeds[s]))
-        distance[s] = _distance(orig_s, _run_inference(loader_factory()))
+        pert_s = _run_inference(loader_factory())
+        perturbed_predictions[s] = pert_s
+        distance[s] = _distance(orig_s, pert_s)
 
         # Restore data from backup.
         clean_data = torch.load(backup_path, weights_only=False)
@@ -235,7 +246,6 @@ def estimate_deviation_from_determinacy(
     per_sample_mean_distances  = distance.mean(axis=1)          # (S,)
     dev_delta                  = float(per_sample_mean_distances.mean())
     dev_std                    = float(per_sample_mean_distances.std() / math.sqrt(num_samples))
-    original_predictions       = orig_preds_all.mean(axis=0)    # (N,) mean over draws
 
     return (
         dev_delta,
@@ -243,5 +253,6 @@ def estimate_deviation_from_determinacy(
         per_instance_dev,
         per_instance_dev_std,
         per_sample_mean_distances,
-        original_predictions,
+        original_predictions,       # (S, N) per-draw original predictions
+        perturbed_predictions,      # (S, N) per-draw perturbed predictions
     )
