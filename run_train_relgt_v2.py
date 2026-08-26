@@ -5,7 +5,8 @@ Mirrors run_train_models_v2.py's structure (per-task TASKS_RELGT config,
 in-package RelGT model + the RelGTTokens transformer-style sampler instead
 of HeteroGraphSAGE + NeighborLoader.
 
-Adapted from train_relgt.py in the rdl-explain repo. Key differences:
+Supersedes the v1-era train_relgt.py (removed; see git history). Key
+differences from it:
   * Reads the v2 graph_data.pt (data + col_stats_dict bundled) rather than
     the v1 separate data.pt + col_stats_dict.pt files.
   * Runs a (lr × seed) grid with per-task hyperparameters from TASKS_RELGT.
@@ -78,8 +79,26 @@ DATA_ROOT = "/home/rissakiagapi/rdl-explain-data"
 OUT_ROOT  = os.path.join(DATA_ROOT, "relbench_models_v2")
 
 # ── Per-task hyperparameters ───────────────────────────────────────────────────
-# num_centroids ≈ round_to_power_of_2(n_train / 75) — see docstring of
-# train_relgt.py for the rationale.
+#
+# Selecting num_centroids
+# -----------------------
+# Target ~50-100 training entities per centroid. Too few entities per centroid
+# means the VQ codebook cold-starts slowly and the log(centroid_count) prior is
+# noisy, causing erratic validation curves in early epochs. Too many centroids
+# relative to training entities wastes codebook capacity and slows EMA
+# convergence.
+#
+# Rule of thumb:
+#     num_centroids = round_to_power_of_2(num_training_entities / 75)
+#
+# Examples:
+#   rel-f1 / driver-dnf
+#       857 unique drivers, 11,411 training rows
+#       857 / 75 ≈ 11   →  num_centroids = 16   (~54 drivers/centroid)
+#
+#   rel-trial / study-outcome
+#       11,994 training studies
+#       11,994 / 75 ≈ 160  →  num_centroids = 128  (~94 studies/centroid)
 TASKS_RELGT_SMALL: Dict[str, Dict[str, Any]] = {
     "rel-f1/driver-dnf": {
         # ~11k train rows, ~857 unique drivers → 16 centroids (~54 drivers/centroid)
