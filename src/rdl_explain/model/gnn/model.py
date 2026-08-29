@@ -35,6 +35,8 @@ from torch_geometric.typing import NodeType
 # Replace with local imports
 # from relbench.modeling.nn import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
 from .nn import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
+# Selection masking is applied here, on the encoded node vectors.
+from rdl_explain.explain.explain_utils import eliminate
 
 class Model(torch.nn.Module):
 
@@ -213,8 +215,9 @@ class Model(torch.nn.Module):
         """
 
         feature_types = ['table', 'column']
+        tuple_types = ['filter']
         message_passing_types = ['fkpk', 'fkpk-layer-wise', 'layer-wise']
-        if explanation_type not in feature_types + message_passing_types:
+        if explanation_type not in feature_types + tuple_types + message_passing_types:
             raise NotImplementedError(
                 f"Explanation type {explanation_type} not implemented."
             )
@@ -222,9 +225,11 @@ class Model(torch.nn.Module):
         # Apply activation to mask
         mask = {key: value.sigmoid() for key, value in mask_dict.items()}
 
-        # Feature-level masking (Projection) is applied in the encoder; FKJoin /
-        # layer-wise masking is applied in the GNN (below). Encode features,
-        # masked for 'table' / 'column', standard otherwise.
+        # Each language masks at a different stage of the pipeline (paper,
+        # Figure 4): Projection inside the feature encoder, Selection on the
+        # encoded node vector, FKJoin during message passing. Note 'filter'
+        # takes the STANDARD encoder here -- it masks whole tuples afterwards,
+        # not individual columns.
         if explanation_type in feature_types:
             # Get initial node features from encoder, applying table / column masking
             x_dict = self.encoder.forward_to_explain(batch.tf_dict, mask, mask_type=explanation_type, elimination_strategy=elimination_strategy, uninformative_feat_vector=uninformative_feat_vector)
@@ -239,6 +244,22 @@ class Model(torch.nn.Module):
 
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+
+        # Selection: mask whole TUPLES on the encoded node vector, after
+        # temporal and shallow embeddings and before message passing. One mask
+        # value per row (the predicate branch that row falls into), broadcast
+        # over the embedding channels. Only the table carrying the predicate is
+        # in `mask`; every other table passes through untouched.
+        if explanation_type in tuple_types:
+            for node_type in x_dict.keys():
+                if node_type in mask:
+                    x_dict[node_type] = eliminate(
+                        x_dict[node_type],
+                        mask[node_type].unsqueeze(1),
+                        strategy=elimination_strategy,
+                        x_default=(uninformative_feat_vector[node_type]
+                                   if uninformative_feat_vector is not None else None),
+                    )
 
         # FKJoin / layer-wise masking happens during message passing.
         if explanation_type in message_passing_types:
