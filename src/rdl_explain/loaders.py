@@ -46,6 +46,8 @@ import yaml
 import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
 
 from relbench.datasets import get_dataset
@@ -70,8 +72,15 @@ class RunConfig(ExplainerConfig):
     # Model architecture (for load_model / Model construction)
     channels: int = 64
     out_channels: int = 1
+    # `aggr` is the SAGEConv message aggregation, i.e. `conv_aggregation` /
+    # `gnn_aggregation` in the training configs. It is NOT a learned parameter,
+    # so a wrong value still passes load_state_dict(strict=True) and silently
+    # produces a broken model -- count-based tasks trained with 'sum' collapse
+    # from ROC-AUC 1.00 to 0.10 under 'mean'. Always set it from the checkpoint's
+    # own config, and confirm with `verify_checkpoint`.
     aggr: Literal["mean", "sum", "max"] = "mean"
-    norm: Literal["batch_norm", "none"] = "batch_norm"
+    norm: Literal["batch_norm", "layer_norm", "none"] = "batch_norm"
+    encoder_layers: int = 2
     shallow_list: List[str] = []
     id_awareness: bool = False
 
@@ -90,6 +99,49 @@ def _read_config_file(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+#: Config keys that mean the same thing as a RunConfig field. The training
+#: pipelines spell the architecture differently from `Model`'s constructor, and
+#: pydantic silently ignores unknown keys -- so an unresolved alias becomes a
+#: wrong-but-plausible model rather than an error.
+_ARCH_ALIASES = {
+    "gnn_aggregation": "aggr",       # gnn_params.json (RelBench models)
+    "conv_aggregation": "aggr",      # model_config.yaml (case-study models)
+    "num_gnn_layers": "gnn_layers",
+    "encoder_num_layers": "encoder_layers",
+}
+
+#: Architectural keys that are NOT silently ignorable: if one of these appears
+#: with a value the open Model cannot honour, loading must fail loudly.
+_ARCH_UNSUPPORTED = {
+    # HeteroConv's aggregation is hardcoded to "sum" in model/gnn/nn.py.
+    "hetero_conv_aggregation": ("sum",),
+}
+
+
+def _resolve_architecture_aliases(d: Dict[str, Any]) -> None:
+    """Rename known architecture aliases in place; reject unsupported values."""
+    for alias, field in _ARCH_ALIASES.items():
+        if alias not in d:
+            continue
+        value = d.pop(alias)
+        if field in d and d[field] != value:
+            raise ValueError(
+                f"config sets both {alias!r}={value!r} and {field!r}={d[field]!r}, "
+                f"but they are the same quantity and disagree — set only one."
+            )
+        d[field] = value
+
+    for key, allowed in _ARCH_UNSUPPORTED.items():
+        if key in d and d[key] not in allowed:
+            raise ValueError(
+                f"config sets {key!r}={d[key]!r}, but this implementation only "
+                f"supports {allowed[0]!r} (hardcoded in model/gnn/nn.py). "
+                f"Loading a checkpoint trained otherwise would silently produce "
+                f"a different model."
+            )
+        d.pop(key, None)
+
+
 def load_config(model_config_path: str) -> RunConfig:
     """Read a config FILE into a RunConfig.
 
@@ -105,11 +157,18 @@ def load_config(model_config_path: str) -> RunConfig:
     neighbors sampled per GNN layer (``fanouts`` is the term ``gnn_params.json``
     uses; ``num_neighbors`` is PyG's NeighborLoader / ExplainerConfig term).
     Either one populates ``num_neighbors``; if both are present and DISAGREE that
-    is a config error. ` 
-    Explanation-time inference should using the same ``fanouts`` / ``num_neighbors`` 
+    is a config error. `
+    Explanation-time inference should using the same ``fanouts`` / ``num_neighbors``
     the model was trained with.
+
+    Architecture aliases are resolved rather than ignored. ``gnn_aggregation``
+    (gnn_params.json) and ``conv_aggregation`` (training model_config.yaml) both
+    mean ``aggr``; these were previously dropped as unknown keys, so a model
+    trained with ``sum`` was silently rebuilt with the ``mean`` default. Any
+    remaining key that looks architectural raises instead of being ignored.
     """
     d = dict(_read_config_file(model_config_path))
+    _resolve_architecture_aliases(d)
     fanouts = d.pop("fanouts", None)
     num_neighbors = d.get("num_neighbors", None)
     if fanouts is not None and num_neighbors is not None \
@@ -324,6 +383,7 @@ def load_model(
         norm=config.norm,
         shallow_list=config.shallow_list,
         id_awareness=config.id_awareness,
+        encoder_layers=config.encoder_layers,
     ).to(config.device)
 
     state_dict = torch.load(model_params_path, weights_only=False,
@@ -331,3 +391,142 @@ def load_model(
     model.load_state_dict(state_dict)
     model.eval()
     return model
+
+
+# ── Checkpoint verification ───────────────────────────────────────────────────
+
+def verify_checkpoint(
+    model: Model,
+    data,
+    entity_table: str,
+    reference: pd.DataFrame,
+    num_neighbors: List[int],
+    node_index_col: str,
+    node_index_offset: int = 0,
+    time_col: Optional[str] = None,
+    temporal_strategy: str = "uniform",
+    output_col: str = "output",
+    batch_size: int = 512,
+    min_correlation: float = 0.99,
+    max_abs_diff: Optional[float] = None,
+    device: str = "cpu",
+    raise_on_mismatch: bool = True,
+) -> Dict[str, float]:
+    """Re-run inference and check it reproduces the checkpoint's own predictions.
+
+    WHY THIS EXISTS. Most of a model's architecture is NOT recoverable from its
+    state dict, because the settings involved have no parameters of their own:
+    the message aggregation (``aggr``), the sampling fanouts, and the text
+    embedder all leave the tensor shapes untouched. A wrong choice therefore
+    passes ``load_state_dict(strict=True)`` without complaint and yields a model
+    that runs, produces confident numbers, and is wrong — a count-based task
+    trained with ``aggr='sum'`` scores ROC-AUC 0.10 when rebuilt with ``'mean'``.
+    Explanations computed on such a model look entirely plausible.
+
+    Comparing against predictions the trained model actually wrote is the only
+    check that covers all of these at once, including mismatches nobody
+    anticipated. Run it once, right after loading, before explaining anything.
+
+    Args:
+        model:            the loaded Model.
+        data:             the HeteroData graph it was loaded onto.
+        entity_table:     prediction entity node type (graph capitalisation).
+        reference:        frame of stored predictions, with ``output_col`` and a
+                          node-index column.
+        num_neighbors:    fanouts; must match those used at training/inference.
+        node_index_col:   column holding the entity id (see NOTE).
+        node_index_offset: added to ``node_index_col`` to get the graph node
+                          index (see NOTE). Explicit, never guessed.
+        time_col:         datetime column of seed timestamps. REQUIRED for a
+                          temporal graph (see NOTE); None for an atemporal one.
+        output_col:       column holding the raw model output (pre-sigmoid).
+        min_correlation:  minimum acceptable Pearson correlation between
+                          recomputed and stored outputs. This -- not absolute
+                          difference -- is the gate; see NOTE on sampling.
+        max_abs_diff:     optional additional strict check, for bundles whose
+                          sampling is deterministic (fanouts exceed every node
+                          degree, so no truncation happens).
+        raise_on_mismatch: raise (default) or just return the measurements.
+
+    Returns:
+        ``{'correlation': float, 'max_abs_diff': float}``.
+
+    NOTE on sampling. With fanouts that truncate (rel-f1 uses [64, 32, 16] over
+    high-degree tables) and ``temporal_strategy='uniform'``, neighbor sampling is
+    STOCHASTIC: two runs of the same correct model differ. Measured on rel-f1,
+    recomputed-vs-stored max|diff| is 0.60 while run-to-run max|diff| is 0.60 --
+    indistinguishable. So an absolute-difference threshold would either reject a
+    correct model or have to be loosened until it accepts a broken one.
+    Correlation separates them cleanly: a correct model scores 0.9998, whereas
+    the wrong ``aggr`` scores -0.62 and the wrong fanouts 0.96.
+
+    NOTE on node indices. Prediction frames carry the entity key and a
+    ``*_mapped`` column, but the relationship between them is NOT the same
+    across datasets -- rel-f1 has ``driverId_mapped == driverId`` (offset 0)
+    while the synthetic database has ``rid_mapped == rid + 1`` (offset -1).
+    A wrong offset does not raise; it silently scores rows against other
+    entities' predictions. Record the offset per bundle and let this function
+    confirm it.
+
+    NOTE on time. If the graph carries ``time``, predictions were produced with
+    time-aware neighbor sampling, and recomputing without it silently gives
+    different (future-leaking) subgraphs and different outputs. Pass the seed
+    timestamps via ``time_col``.
+    """
+    from torch_geometric.loader import NeighborLoader
+    from relbench.modeling.utils import to_unix_time
+
+    graph_is_temporal = any("time" in data[nt] for nt in data.node_types)
+    if graph_is_temporal and time_col is None:
+        raise ValueError(
+            "this graph has time attributes, so its predictions were produced "
+            "with time-aware sampling; pass `time_col` (the seed-timestamp "
+            "column of `reference`) or verification will not reproduce them."
+        )
+
+    idx = torch.as_tensor(
+        reference[node_index_col].to_numpy() + node_index_offset,
+        dtype=torch.long)
+    loader_kwargs = dict(
+        num_neighbors=num_neighbors, input_nodes=(entity_table, idx),
+        batch_size=batch_size, shuffle=False,
+    )
+    if time_col is not None:
+        loader_kwargs.update(
+            time_attr="time",
+            input_time=torch.from_numpy(to_unix_time(reference[time_col])),
+            temporal_strategy=temporal_strategy,
+        )
+    loader = NeighborLoader(data, **loader_kwargs)
+    model.eval()
+    outs = []
+    with torch.no_grad():
+        for batch in loader:
+            outs.append(model(batch.to(device), entity_table).view(-1).cpu())
+    recomputed = torch.cat(outs).numpy()
+
+    stored = reference[output_col].to_numpy()
+    max_diff = float(np.abs(recomputed - stored).max())
+    correlation = float(np.corrcoef(recomputed, stored)[0, 1])
+    result = {"correlation": correlation, "max_abs_diff": max_diff}
+
+    failures = []
+    if correlation < min_correlation:
+        failures.append(f"correlation {correlation:.5f} < {min_correlation}")
+    if max_abs_diff is not None and max_diff > max_abs_diff:
+        failures.append(f"max|diff| {max_diff:.4g} > {max_abs_diff:g}")
+
+    if failures and raise_on_mismatch:
+        raise ValueError(
+            f"checkpoint verification FAILED: {'; '.join(failures)}.\n"
+            f"The weights loaded, so this is almost certainly a "
+            f"parameter-free architecture mismatch. Check, in order:\n"
+            f"  - aggr: 'sum' vs 'mean' (count-based tasks need 'sum')\n"
+            f"  - num_neighbors/fanouts: must match the trained model\n"
+            f"  - encoder_layers: torch_frame ResNet depth (1 or 2)\n"
+            f"  - the text embedder used to build the graph (GloVe 300-d vs "
+            f"DistilBERT 768-d)\n"
+            f"  - node_index_offset: 0 for rel-f1, -1 for the synthetic database\n"
+            f"  - time_col / temporal_strategy for a temporal graph"
+        )
+    return result
