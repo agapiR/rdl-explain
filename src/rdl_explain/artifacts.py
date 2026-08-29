@@ -153,3 +153,91 @@ def load_bundle(
 def predictions_dir(name: str) -> str:
     """Directory of a bundle's stored predictions (for make_explanation_task)."""
     return os.path.join(bundle_path(name), read_manifest(name)["predictions"]["dir"])
+
+
+# ── Task ──────────────────────────────────────────────────────────────────────
+
+class BundleTask:
+    """An ``EntityTask``-compatible task built from a bundle's own files.
+
+    RelBench's ``get_task`` is not used here, for two reasons. It downloads task
+    tables whose checksums have drifted from the ones relbench 1.1.0 pins (the
+    fetch fails outright on a clean machine), and some bundles -- the synthetic
+    database -- are not RelBench datasets at all. Everything the explanation
+    pipeline needs from a task is metadata (``entity_table``, ``entity_col``,
+    ``target_col``, ``task_type``) plus the split tables, and the bundle already
+    carries all of it.
+    """
+
+    def __init__(self, spec: Dict[str, Any], tables: Dict[str, Any]):
+        from relbench.base import TaskType
+        self.entity_table = spec["entity_table"]
+        self.entity_col = spec["entity_col"]
+        self.time_col = spec.get("time_col")
+        self.target_col = spec["target_col"]
+        self.task_type = TaskType(spec["task_type"])
+        self.dataset_name = spec.get("dataset_name")
+        self.task_name = spec.get("task_name")
+        self.train_table = tables["train"]
+        self.val_table = tables["val"]
+        self.test_table = tables["test"]
+
+    def get_table(self, split: str, mask_input_cols: Optional[bool] = None):
+        return {"train": self.train_table, "val": self.val_table,
+                "test": self.test_table}[split]
+
+
+def load_task(name: str) -> BundleTask:
+    """Build the bundle's prediction task from its stored prediction tables.
+
+    The entity column is normalised to GRAPH NODE INDICES using the manifest's
+    ``node_index_col`` / ``node_index_offset``, because that is what
+    ``get_node_train_table_input`` feeds straight to the sampler. The offset is
+    not a shared convention across datasets -- see ``verify_checkpoint``.
+    """
+    from relbench.base import Table
+
+    manifest = read_manifest(name)
+    spec, pred = manifest["task"], manifest["predictions"]
+    root = os.path.join(bundle_path(name), pred["dir"])
+    offset = pred.get("node_index_offset", 0)
+
+    tables = {}
+    for split in ("train", "val", "test"):
+        df = pd.read_parquet(os.path.join(root, f"predictions_{split}.parquet")).copy()
+        df[spec["entity_col"]] = df[pred["node_index_col"]] + offset
+        tables[split] = Table(
+            df=df,
+            fkey_col_to_pkey_table={spec["entity_col"]: spec["entity_table"]},
+            pkey_col=None,
+            time_col=spec.get("time_col"),
+        )
+    return BundleTask(spec, tables)
+
+
+def load_explanation_task(
+    name: str,
+    explanation_target_type: str = "soft",
+    subsample_per_split: Optional[int] = None,
+    subsample_balanced: bool = True,
+    subsample_seed: int = 42,
+):
+    """Build the explanation task for a bundle (model predictions as targets)."""
+    from rdl_explain.explain.explain_utils import make_explanation_task
+
+    task = load_task(name)
+    predictions = {
+        split: {col: task.get_table(split).df[col].to_numpy()
+                for col in ("output", "processed_output", "predictions")}
+        for split in ("train", "val", "test")
+    }
+    data = torch.load(
+        os.path.join(bundle_path(name), read_manifest(name)["graph"]["data"]),
+        map_location="cpu", weights_only=False)
+    return make_explanation_task(
+        task, data, predictions=predictions,
+        explanation_target_type=explanation_target_type,
+        subsample_per_split=subsample_per_split,
+        subsample_balanced=subsample_balanced,
+        subsample_seed=subsample_seed,
+    )
