@@ -56,3 +56,5 @@ docs/
 *.pdf
 *.md
 *.txt
+# Downloaded / staged artifact bundles (distributed separately, see README)
+artifacts/

@@ -44,14 +44,32 @@ from rdl_explain.model import Model
 
 #: Environment variable naming the artifact root.
 DATA_ROOT_ENV = "RDL_EXPLAIN_DATA"
-DEFAULT_DATA_ROOT = "./artifacts"
+DEFAULT_DATA_ROOT = "artifacts"
 
 MANIFEST_NAME = "manifest.json"
 
 
 def data_root() -> str:
-    """Root directory holding the downloaded artifact bundles."""
-    return os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)
+    """Root directory holding the downloaded artifact bundles.
+
+    ``$RDL_EXPLAIN_DATA`` wins if set. Otherwise search upward from the working
+    directory for an ``artifacts/`` directory: a plain relative default resolves
+    against the CALLER's cwd, so a notebook run from ``notebooks/`` would look
+    for ``notebooks/artifacts`` and miss the one at the project root.
+    """
+    configured = os.environ.get(DATA_ROOT_ENV)
+    if configured:
+        return configured
+
+    here = os.path.abspath(os.getcwd())
+    while True:
+        candidate = os.path.join(here, DEFAULT_DATA_ROOT)
+        if os.path.isdir(candidate):
+            return candidate
+        parent = os.path.dirname(here)
+        if parent == here:            # reached the filesystem root
+            return DEFAULT_DATA_ROOT  # report the plain default in errors
+        here = parent
 
 
 def bundle_path(name: str) -> str:
@@ -65,9 +83,12 @@ def read_manifest(name: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"no {MANIFEST_NAME} at {path}.\n"
-            f"Artifacts are looked up under {data_root()!r} "
-            f"(set ${DATA_ROOT_ENV} to change this). Download the bundle from "
-            f"the link in the README and unzip it there."
+            f"Artifacts are looked up under {data_root()!r}, resolved from the "
+            f"working directory {os.getcwd()!r}.\n"
+            f"Either download the bundle from the link in the README and unzip "
+            f"it there, or point ${DATA_ROOT_ENV} at an existing artifacts "
+            f"directory:\n"
+            f"    os.environ[{DATA_ROOT_ENV!r}] = '/path/to/artifacts'"
         )
     with open(path) as f:
         return json.load(f)
