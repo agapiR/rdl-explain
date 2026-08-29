@@ -27,6 +27,27 @@ from relbench.modeling.graph import NodeTrainTableInput, get_node_train_table_in
 from relbench.modeling.graph import AttachTargetTransform
 
 
+def _assert_discrete_mask(mask) -> None:
+    """Reject a continuous mask before it reaches the perturbation code.
+
+    `perturb_instance` needs bool tensors (True = retained). A float mask of
+    0.0/1.0 fails deep inside it with an opaque `operator.invert` TypeError, and
+    an int mask is worse: `~` yields nonzero (truthy) values for BOTH states, so
+    every element is perturbed and devDelta comes back silently wrong.
+    """
+    values = mask['params'].values() if isinstance(mask, dict) and 'params' in mask \
+        else mask.values()
+    for value in values:
+        if torch.is_tensor(value) and value.dtype is not torch.bool:
+            raise TypeError(
+                f"estimate_devdelta expects a discrete mask of torch.bool "
+                f"tensors (True = retained), got dtype {value.dtype}. Threshold "
+                f"the learned mask first:\n"
+                f"    from rdl_explain.explain.masks import discretize_mask\n"
+                f"    hard = discretize_mask(mask)  # delta=0.1, the paper's value"
+            )
+
+
 class RDLExplainer(ABC):
 
     name = "node_rdl_explainer"
@@ -574,10 +595,17 @@ class RDLExplainer(ABC):
         for mask learning (``learn_masks`` also defaults to ``'train'``). Pass a
         different ``split`` (or a ``node_id_filter``) to evaluate elsewhere.
 
+        The mask must be DISCRETE (bool tensors, ``True`` = retained). Threshold
+        the learned mask first::
+
+            from rdl_explain.explain.masks import discretize_mask
+            dev = explainer.estimate_devdelta(mask=discretize_mask(mask), ...)
+
         Returns ``(dev_delta, dev_sem, per_instance_dev, per_instance_dev_std,
         per_sample_mean_distances, original_predictions)`` — see
         ``estimate_deviation_from_determinacy``.
         """
+        _assert_discrete_mask(mask)
         node_ids = node_id_filter
         if node_ids is not None and not torch.is_tensor(node_ids):
             node_ids = torch.as_tensor(node_ids)

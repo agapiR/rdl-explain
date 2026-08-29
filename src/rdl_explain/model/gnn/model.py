@@ -51,6 +51,10 @@ class Model(torch.nn.Module):
         shallow_list: List[NodeType] = [],
         # ID awareness
         id_awareness: bool = False,
+        # Depth of the per-table PyTorch Frame ResNet feature encoder. Must match
+        # the checkpoint being loaded: the paper's RelBench models use 2, while
+        # the case-study models use 1.
+        encoder_layers: int = 2,
     ):
         super().__init__()
 
@@ -61,7 +65,8 @@ class Model(torch.nn.Module):
                 for node_type in data.node_types
             },
             node_to_col_stats=col_stats_dict,
-            torch_frame_model_kwargs={"channels": channels, "num_layers": 2}
+            torch_frame_model_kwargs={"channels": channels,
+                                      "num_layers": encoder_layers}
         )
         self.temporal_encoder = HeteroTemporalEncoder(
             node_types=[
@@ -104,17 +109,39 @@ class Model(torch.nn.Module):
         if self.id_awareness_emb is not None:
             self.id_awareness_emb.reset_parameters()
 
+    def _relative_time(
+        self,
+        batch: HeteroData,
+        entity_table: NodeType,
+    ) -> Tuple[int, Dict[NodeType, Tensor]]:
+        """Resolve the seed count and relative-time encodings for a batch.
+
+        Temporal graphs behave exactly as before. Atemporal graphs (no node type
+        carries a ``time`` attribute, e.g. the synthetic R-S-T database) have an
+        empty temporal encoder and no ``seed_time``: reading ``batch.time_dict``
+        there raises, so skip relative-time encoding and take the seed count from
+        the entity store's ``batch_size``.
+        """
+        store = batch[entity_table]
+        seed_time = getattr(store, 'seed_time', None)
+
+        if seed_time is None or len(self.temporal_encoder.encoder_dict) == 0:
+            n_seed = (seed_time.size(0) if seed_time is not None
+                      else store.batch_size)
+            return n_seed, {}
+
+        return seed_time.size(0), self.temporal_encoder(
+            seed_time, batch.time_dict, batch.batch_dict
+        )
+
     def forward(
         self,
         batch: HeteroData,
         entity_table: NodeType,
     ) -> Tensor:
-        seed_time = batch[entity_table].seed_time
         x_dict = self.encoder(batch.tf_dict)
 
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
+        n_seed, rel_time_dict = self._relative_time(batch, entity_table)
 
         for node_type, rel_time in rel_time_dict.items():
             x_dict[node_type] = x_dict[node_type] + rel_time
@@ -129,7 +156,7 @@ class Model(torch.nn.Module):
             batch.num_sampled_edges_dict,
         )
 
-        return self.head(x_dict[entity_table][: seed_time.size(0)])
+        return self.head(x_dict[entity_table][:n_seed])
 
     def forward_dst_readout(
         self,
@@ -141,14 +168,12 @@ class Model(torch.nn.Module):
             raise RuntimeError(
                 "id_awareness must be set True to use forward_dst_readout"
             )
-        seed_time = batch[entity_table].seed_time
         x_dict = self.encoder(batch.tf_dict)
-        # Add ID-awareness to the root node
-        x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
 
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
+        n_seed, rel_time_dict = self._relative_time(batch, entity_table)
+
+        # Add ID-awareness to the root node
+        x_dict[entity_table][:n_seed] += self.id_awareness_emb.weight
 
         for node_type, rel_time in rel_time_dict.items():
             x_dict[node_type] = x_dict[node_type] + rel_time
@@ -194,8 +219,6 @@ class Model(torch.nn.Module):
                 f"Explanation type {explanation_type} not implemented."
             )
 
-        seed_time = batch[entity_table].seed_time
-
         # Apply activation to mask
         mask = {key: value.sigmoid() for key, value in mask_dict.items()}
 
@@ -209,9 +232,7 @@ class Model(torch.nn.Module):
             # Standard encoding; masking happens during message passing.
             x_dict = self.encoder(batch.tf_dict)
 
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
+        n_seed, rel_time_dict = self._relative_time(batch, entity_table)
 
         for node_type, rel_time in rel_time_dict.items():
             x_dict[node_type] = x_dict[node_type] + rel_time
@@ -238,7 +259,7 @@ class Model(torch.nn.Module):
                 batch.num_sampled_edges_dict,
             )
 
-        return self.head(x_dict[entity_table][: seed_time.size(0)])
+        return self.head(x_dict[entity_table][:n_seed])
 
     def get_intermediate_encoding(
         self,

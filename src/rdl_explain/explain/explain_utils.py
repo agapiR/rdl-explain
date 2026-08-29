@@ -677,8 +677,14 @@ def make_explanation_task(prediction_task, data, inference_dir=None,
 
     for split in ['train', 'val', 'test']:
         preds_split = _load_one(split)
-        table       = prediction_task.get_table(split)
-        table.df    = preds_split
+        # Copy the table before overwriting its frame. `get_table` returns the
+        # task's own (cached) Table object, so mutating it in place would also
+        # rewrite the CALLER's `prediction_task` -- leaving it holding the
+        # explanation frame instead of its labels, and making a second
+        # `make_explanation_task` call on the same task read already-mutated
+        # input. Copy from `explanation_task` (the deepcopy) for the same reason.
+        table    = copy.copy(explanation_task.get_table(split))
+        table.df = preds_split
         setattr(explanation_task, f'{split}_table', table)
 
     # `preds` retained for the assert + downstream targets-column setup, using
