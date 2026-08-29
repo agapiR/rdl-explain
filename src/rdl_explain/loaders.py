@@ -460,13 +460,10 @@ def verify_checkpoint(
     Correlation separates them cleanly: a correct model scores 0.9998, whereas
     the wrong ``aggr`` scores -0.62 and the wrong fanouts 0.96.
 
-    NOTE on node indices. Prediction frames carry the entity key and a
-    ``*_mapped`` column, but the relationship between them is NOT the same
-    across datasets -- rel-f1 has ``driverId_mapped == driverId`` (offset 0)
-    while the synthetic database has ``rid_mapped == rid + 1`` (offset -1).
-    A wrong offset does not raise; it silently scores rows against other
-    entities' predictions. Record the offset per bundle and let this function
-    confirm it.
+    NOTE on node indices. Prediction frames carry BOTH the entity column
+    (``rid`` / ``driverId`` / ``nct_id``) and a ``*_mapped`` column. 
+    It is the plain entity column that holds the graph node index, while 
+    ``*_mapped`` is the original database key.
 
     NOTE on time. If the graph carries ``time``, predictions were produced with
     time-aware neighbor sampling, and recomputing without it silently gives
@@ -524,9 +521,8 @@ def verify_checkpoint(
             f"  - aggr: 'sum' vs 'mean' (count-based tasks need 'sum')\n"
             f"  - num_neighbors/fanouts: must match the trained model\n"
             f"  - encoder_layers: torch_frame ResNet depth (1 or 2)\n"
-            f"  - the text embedder used to build the graph (GloVe 300-d vs "
-            f"DistilBERT 768-d)\n"
-            f"  - node_index_offset: 0 for rel-f1, -1 for the synthetic database\n"
+            f"  - the text embedder used to build the graph\n"
+            f"  - node_index_col: use the plain entity column\n"
             f"  - time_col / temporal_strategy for a temporal graph"
         )
     return result
