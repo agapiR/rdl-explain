@@ -49,12 +49,12 @@ Thumbs.db
 results/
 cache*/
 
-# Generated artifacts (demo figures)
+# Local research notes and scratch output. 
 figures/
-new_scripts/
-docs/
+results/
+
+# The paper PDF and its figures are distributed by the publisher, not here.
 *.pdf
-*.md
-*.txt
+
 # Downloaded / staged artifact bundles (distributed separately, see README)
 artifacts/
