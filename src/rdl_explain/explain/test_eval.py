@@ -1,8 +1,7 @@
 """Smoke tests and integration tests for estimate_deviation_from_determinacy.
 
 Run with:
-    /home/rissakiagapi/anaconda3/envs/relbench_v1/bin/python \
-        src/rdl_explain/explain/test_eval.py
+    python src/rdl_explain/explain/test_eval.py
 
 Smoke tests: all external I/O (perturb_instance, torch.save/load, os.remove)
 is patched so they run without real data files or model checkpoints.

@@ -211,7 +211,13 @@ def main(src_root, out_dir):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--src-root", default="/home/rissakiagapi/rdl-explain-data")
+    p.add_argument("--src-root", default=os.environ.get("RDL_EXPLAIN_SRC_ROOT"),
+                   help="root holding relbench_models/ and eval_local/ "
+                        "(default: $RDL_EXPLAIN_SRC_ROOT)")
     p.add_argument("--out-dir", default="artifacts")
     a = p.parse_args()
+    if not a.src_root:
+        p.error("--src-root is required (or set $RDL_EXPLAIN_SRC_ROOT). This is "
+                "the maintainer-side directory holding the trained models and "
+                "graphs the bundles are assembled from.")
     main(a.src_root, a.out_dir)
